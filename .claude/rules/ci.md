@@ -77,3 +77,19 @@ paths:
 - CI runs `agtermTests` against the real `TEST_HOST`, with launch-time state/config/socket isolation and
   `AGTERM_HOSTED_TESTS=1` to suppress shells and the control server. It does not run `agtermUITests`.
   The badge reports only `agtermCore` coverage.
+
+## On-demand universal build (`universal-build.yml`)
+
+- `workflow_dispatch` only, and it gates nothing: it exists to hand out a bundle that runs on Intel
+  as well as Apple Silicon, which no `ci.yml` job produces. GitHub retired its Intel macOS runners,
+  so `AGTERM_UNIVERSAL=1` cross-compiles the x86_64 slice from the same `macos-26` arm64 runner.
+- Its libghostty cache key carries `universal`: the `ci.yml` key names only `runner.arch`, and the
+  two runners agree on that while their staged xcframeworks hold different slices. `setup.sh` would
+  catch the mismatch and rebuild, but the job could never write its own entry back.
+- It asserts both slices in `agterm` AND `agtermctl`. They come from different toolchains
+  (`xcodebuild` and SwiftPM), so only the app's own slices are guaranteed by `ARCHS`.
+- The app ships ad-hoc signed and unnotarized, and is packaged with `ditto` rather than handed to
+  `upload-artifact` as a bundle: that action's zip drops the executable bit and the bundle symlinks.
+  The step summary carries the `xattr -dr com.apple.quarantine` line a downloader needs.
+- It creates no release and pushes no tag. Signed releases are local (`.claude/rules/release.md`),
+  and a workflow publishing to the same tag would collide with `release.sh`.
