@@ -92,8 +92,10 @@ paths:
   catch the mismatch and rebuild, but the job could never write its own entry back.
 - It asserts both slices in `agterm` AND `agtermctl`. They come from different toolchains
   (`xcodebuild` and SwiftPM), so only the app's own slices are guaranteed by `ARCHS`.
-- The app ships ad-hoc signed and unnotarized, and is packaged with `ditto` rather than handed to
-  `upload-artifact` as a bundle: that action's zip drops the executable bit and the bundle symlinks.
-  The step summary carries the `xattr -dr com.apple.quarantine` line a downloader needs.
+- The app ships ad-hoc signed and unnotarized, packaged by `scripts/dmg.sh` — the same image
+  `release.sh` signs, minus the identity. Handing the bundle to `upload-artifact` instead is not an
+  option: that action's zip drops the executable bit and the bundle symlinks. Artifacts are always
+  delivered inside GitHub's own zip, so a downloader unwraps that before the DMG.
+  The step summary carries the `xattr -dr com.apple.quarantine` line an unnotarized build needs.
 - It creates no release and pushes no tag. Signed releases are local (`.claude/rules/release.md`),
   and a workflow publishing to the same tag would collide with `release.sh`.

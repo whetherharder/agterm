@@ -11,6 +11,8 @@ paths:
   creates the tag and GitHub release, uploads the DMG, then pushes the Homebrew cask to
   `umputun/homebrew-apps` using the maintainer's `gh` auth. It needs no `HOMEBREW_TAP_PAT`. The DMG
   container must be codesigned before notarization or `spctl` rejects `hdiutil`'s unsigned image.
+  The image itself comes from `scripts/dmg.sh`, shared with `universal-build.yml`; only signing,
+  notarizing and stapling it stay here, where the identity is.
   Without `--publish`, the full build/sign/notarize/staple/`spctl` dry-run stops before upload.
 - Before writing or committing a release section, put the exact `CHANGELOG.md` text in a temp file and
   pass it through the `draft-approval` skill's `draft-review.sh`; address annotations and get explicit

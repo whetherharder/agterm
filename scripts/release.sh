@@ -183,13 +183,7 @@ if [ "$SIGNED" = "1" ]; then
 fi
 
 # ── package the DMG ───────────────────────────────────────────────────────────
-STAGING="$BUILD_DIR/dmg-staging"
-rm -rf "$STAGING"; mkdir -p "$STAGING"
-cp -R "$APP" "$STAGING/"
-ln -s /Applications "$STAGING/Applications"
-rm -f "$DMG"
-hdiutil create -volname agterm -srcfolder "$STAGING" -ov -format UDZO "$DMG"
-rm -rf "$STAGING"
+"$(dirname "$0")/dmg.sh" "$APP" "$DMG"
 
 # ── sign + notarize + staple the DMG ──────────────────────────────────────────
 # codesign the DMG container itself (create → sign → notarize → staple), so the
