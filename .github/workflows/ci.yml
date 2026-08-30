@@ -122,7 +122,8 @@ jobs:
             GhosttyKit.xcframework
             agterm/Resources/ghostty
             agterm/Resources/terminfo
-          key: ghosttykit-${{ hashFiles('scripts/setup.sh') }}
+          # the staged xcframework carries only the runner's arch, so the key names it too
+          key: ghosttykit-${{ runner.arch }}-${{ hashFiles('scripts/setup.sh') }}
       - name: Install xcodegen
         run: brew install xcodegen
       - name: Build libghostty + app (Release)

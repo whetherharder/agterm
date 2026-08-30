@@ -25,6 +25,15 @@ GHOSTTY_REV="683d8db643b95cf229bfb5fe9fab9ae677920343"  # 2026-08-25
 # it cuts the real versioned formula, as it already has for zig@0.15 and zig@0.14.
 ZIG_FORMULA="zig@0.16"  # resolved by prefix, so an unlinked keg works
 XCFRAMEWORK_DIR="GhosttyKit.xcframework"
+# `native` builds the one slice the app then links, on Apple Silicon and Intel alike. AGTERM_UNIVERSAL=1
+# builds both, which roughly doubles this one-time cost and is only worth it to ship a single bundle.
+if [[ "${AGTERM_UNIVERSAL:-0}" == "1" ]]; then
+  XCFRAMEWORK_TARGET=universal
+  WANT_ARCHS=(arm64 x86_64)
+else
+  XCFRAMEWORK_TARGET=native
+  WANT_ARCHS=("$(uname -m)")
+fi
 # terminfo/ is the marker: it must extract as a SIBLING of ghostty/ so libghostty's
 # TERMINFO=dirname(GHOSTTY_RESOURCES_DIR)/terminfo derivation resolves xterm-ghostty.
 RESOURCES_MARKER="agterm/Resources/terminfo"
@@ -49,6 +58,20 @@ need_res=true
 if [[ ! -f "$STAMP_FILE" || "$(cat "$STAMP_FILE")" != "$GHOSTTY_REV" ]]; then
   need_xc=true
   need_res=true
+fi
+
+# the stamp records the revision, not the slices, so a current-rev xcframework can still be the wrong
+# shape: a checkout carried between Macs, or one switching to a universal build, has artifacts that
+# simply lack the arch the app must link. The resources are arch-free and stay as staged.
+if ! $need_xc; then
+  staged="$(for lib in "$XCFRAMEWORK_DIR"/macos-*/*.a; do lipo -archs "$lib" 2>/dev/null; done | tr ' ' '\n' | sort -u)"
+  # an unreadable staging leaves the stamp in charge: unconditionally rebuilding on a result this
+  # check cannot interpret would rebuild libghostty on every single invocation.
+  if [[ -n "$staged" ]]; then
+    for arch in "${WANT_ARCHS[@]}"; do
+      grep -qx "$arch" <<<"$staged" || need_xc=true
+    done
+  fi
 fi
 
 if ! $need_xc && ! $need_res; then
@@ -81,8 +104,8 @@ git -C "$BUILD_DIR" remote add origin "$GHOSTTY_REPO"
 git -C "$BUILD_DIR" fetch -q --depth 1 origin "$GHOSTTY_REV"
 git -C "$BUILD_DIR" -c advice.detachedHead=false checkout -q FETCH_HEAD
 
-echo "building GhosttyKit.xcframework with zig (a few minutes)..."
-( cd "$BUILD_DIR" && "$ZIG" build -Doptimize=ReleaseFast -Demit-xcframework=true -Dxcframework-target=native -Demit-macos-app=false )
+echo "building GhosttyKit.xcframework ($XCFRAMEWORK_TARGET) with zig (a few minutes)..."
+( cd "$BUILD_DIR" && "$ZIG" build -Doptimize=ReleaseFast -Demit-xcframework=true -Dxcframework-target="$XCFRAMEWORK_TARGET" -Demit-macos-app=false )
 
 if $need_xc; then
   echo "staging GhosttyKit.xcframework..."

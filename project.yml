@@ -16,8 +16,11 @@ settings:
     SWIFT_VERSION: "6.0"
     SDKROOT: macosx
     MACOSX_DEPLOYMENT_TARGET: "14.0"
-    ARCHS: arm64
-    ONLY_ACTIVE_ARCH: NO
+    # Build for the Mac doing the building. setup.sh stages a native-arch libghostty, so the
+    # active arch is the only slice there is to link; AGTERM_UNIVERSAL=1 stages both and the
+    # build scripts widen ARCHS to match.
+    ARCHS: "$(ARCHS_STANDARD)"
+    ONLY_ACTIVE_ARCH: YES
     SWIFT_STRICT_CONCURRENCY: complete
     # The agtermTests scheme intentionally builds serially so the app's deep-sign
     # phase finishes before Xcode places its hosted test bundle inside the app.
@@ -29,11 +32,6 @@ settings:
     DEVELOPMENT_TEAM: ""
     CLANG_CXX_LANGUAGE_STANDARD: "c++17"
     CLANG_CXX_LIBRARY: "libc++"
-  configs:
-    Debug:
-      ONLY_ACTIVE_ARCH: YES
-    Release:
-      ONLY_ACTIVE_ARCH: NO
 
 packages:
   agtermCore:
@@ -142,8 +140,12 @@ targets:
           # otherwise trip the re-seal below.
           rm -rf "$CODESIGNING_FOLDER_PATH/Contents/Resources/AppIcon.icon"
           core="$SRCROOT/agtermCore"
-          swift build --package-path "$core" -c release --product agtermctl
-          src="$(swift build --package-path "$core" -c release --product agtermctl --show-bin-path)/agtermctl"
+          # SwiftPM builds host-arch-only unless every arch is named, which would leave a
+          # universal app carrying a thin helper. Single-arch builds keep the plain invocation.
+          set --
+          case "$ARCHS" in *" "*) for arch in $ARCHS; do set -- "$@" --arch "$arch"; done ;; esac
+          swift build --package-path "$core" -c release --product agtermctl "$@"
+          src="$(swift build --package-path "$core" -c release --product agtermctl "$@" --show-bin-path)/agtermctl"
           dest="$CODESIGNING_FOLDER_PATH/Contents/MacOS/agtermctl"
           mkdir -p "$(dirname "$dest")"
           cp -f "$src" "$dest"

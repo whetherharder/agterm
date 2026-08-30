@@ -15,7 +15,8 @@ paths:
 - `test` runs `swift test --enable-code-coverage` in `agtermCore`, exports lcov, and uploads it.
   `coverage`, the only Swift-gated Linux job, downloads it for best-effort Coveralls.
   `lint` installs SwiftLint and runs `swiftlint lint --strict`; every warning fails.
-- `build` restores the libghostty/resource `actions/cache` keyed by `hashFiles('scripts/setup.sh')`,
+- `build` restores the libghostty/resource `actions/cache` keyed by `runner.arch` and
+  `hashFiles('scripts/setup.sh')` — the staged xcframework holds only the building Mac's slice —
   installs xcodegen, runs Release `scripts/build.sh`, asserts the built `agtermctl` carries no
   entitlements, then Debug `scripts/test-app.sh`. Editing
   `setup.sh` rebuilds libghostty. Keep both app builds: Release exercises the whole-module optimizer and

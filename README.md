@@ -57,7 +57,7 @@ A split session, two panes side by side on different color themes:
 
 ## Install
 
-Pre-built releases are for **Apple Silicon (arm64) Macs running macOS 14 or later**.
+Pre-built releases are for **Apple Silicon (arm64) Macs running macOS 14 or later**. Intel Macs are not covered by the DMG but do build from source; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Releases are signed with a Developer ID certificate and notarized by Apple, so macOS Gatekeeper opens them with no extra steps.
 

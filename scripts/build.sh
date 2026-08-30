@@ -14,7 +14,8 @@ GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 # result reaches the `-n` check.
 VERSION="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null | sed 's/^v//' || true)"
 [ -n "$VERSION" ] || VERSION="0.0.0"
+. "$(dirname "$0")/archs.sh"
 xcodebuild -project agterm.xcodeproj -scheme agterm -configuration Release \
-  -derivedDataPath build/DerivedData \
+  -derivedDataPath build/DerivedData "${ARCH_SETTINGS[@]}" \
   MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$VERSION" GIT_COMMIT="$GIT_COMMIT" build
 echo "built: build/DerivedData/Build/Products/Release/agterm.app"

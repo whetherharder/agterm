@@ -103,7 +103,7 @@ notarize() {
 }
 
 # build the GitHub release body: the matching CHANGELOG.md section followed by a
-# short install note (signed + notarized; Apple Silicon only, macOS 14+).
+# short install note (signed + notarized, plus the architectures the build actually produced).
 release_notes() {
   local section
   section="$(awk -v ver="v$VERSION" '
@@ -121,7 +121,7 @@ release_notes() {
   cat <<EOF
 ---
 
-Signed with a Developer ID certificate and notarized by Apple, so macOS Gatekeeper opens it with no extra steps. Apple Silicon (arm64) only, macOS 14 or later.
+Signed with a Developer ID certificate and notarized by Apple, so macOS Gatekeeper opens it with no extra steps. $ARCH_NOTE
 
 - **Homebrew:** \`brew install --cask umputun/apps/agterm\`
 - **Direct download:** open the \`.dmg\` and drag \`agterm.app\` into \`/Applications\`.
@@ -136,11 +136,22 @@ xcodegen generate >/dev/null
 # timestamp, so trying to inject Developer ID at build time is racy. Instead we
 # re-sign authoritatively below, AFTER xcodebuild returns.
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+. "$(dirname "$0")/archs.sh"
 xcodebuild -project agterm.xcodeproj -scheme agterm -configuration Release \
-  -derivedDataPath "$BUILD_DIR/DerivedData" \
+  -derivedDataPath "$BUILD_DIR/DerivedData" "${ARCH_SETTINGS[@]}" \
   MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$VERSION" GIT_COMMIT="$GIT_COMMIT" \
   build
 [ -d "$APP" ] || { echo "expected app not found: $APP" >&2; exit 1; }
+
+# the release note and the cask constraint describe the bundle that was just built, so an Intel or a
+# universal release states its own terms rather than inheriting the Apple Silicon ones.
+APP_ARCHS="$(lipo -archs "$APP/Contents/MacOS/agterm" | tr ' ' '\n' | sort | tr '\n' ' ')"
+case "$APP_ARCHS" in
+  "arm64 ")        ARCH_NOTE="Apple Silicon (arm64) only, macOS 14 or later."; CASK_ARCH=":arm64" ;;
+  "x86_64 ")       ARCH_NOTE="Intel (x86_64) only, macOS 14 or later."; CASK_ARCH=":intel" ;;
+  "arm64 x86_64 ") ARCH_NOTE="Universal (Apple Silicon and Intel), macOS 14 or later."; CASK_ARCH="" ;;
+  *) echo "unexpected architectures in $APP: $APP_ARCHS" >&2; exit 1 ;;
+esac
 
 # authoritative Developer ID signing — AFTER xcodebuild so nothing clobbers it,
 # with a secure --timestamp on every Mach-O (notarization requires it). Sign the
@@ -221,6 +232,13 @@ if [ ! -f "$CASK" ]; then
 fi
 sed -i '' -E "s/^( *version )\".*\"/\1\"$VERSION\"/" "$CASK"
 sed -i '' -E "s/^( *sha256 )\".*\"/\1\"$SHA\"/" "$CASK"
+# rewritten rather than patched in place: the tap file persists between releases, so a universal DMG
+# drops the constraint entirely and the next single-arch release has to put it back.
+awk -v dep="$CASK_ARCH" '
+  /^ *depends_on arch: / { next }
+  { print }
+  dep != "" && /^ *depends_on macos: / { print "  depends_on arch: " dep }
+' "$CASK" >"$CASK.tmp" && mv "$CASK.tmp" "$CASK"
 git -C "$TAP_DIR" add Casks/agterm.rb
 if git -C "$TAP_DIR" diff --cached --quiet; then
   echo "==> cask already at $VERSION, nothing to push"

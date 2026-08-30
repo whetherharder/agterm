@@ -27,6 +27,8 @@ scripts/setup.sh
 
 It builds `GhosttyKit.xcframework` and the ghostty resources from upstream ghostty source at a pinned commit, which needs the `zig@0.16` keg and Xcode's Metal Toolchain (downloaded automatically on the first run). It takes a few minutes. Later runs skip the build once the artifacts are present, so day-to-day work pays nothing.
 
+Both Apple Silicon and Intel Macs build: libghostty and the app are built for the Mac you build on, and nothing in the tree assumes an architecture. `AGTERM_UNIVERSAL=1` builds both slices instead — `AGTERM_UNIVERSAL=1 make release` (or `make dist`) produces one bundle that runs on either, at the cost of a second libghostty build. Switching between the two restages `GhosttyKit.xcframework`; the pre-built releases stay Apple Silicon.
+
 After that:
 
 | command | what it does |
