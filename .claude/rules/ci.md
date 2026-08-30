@@ -96,6 +96,8 @@ paths:
   `release.sh` signs, minus the identity. Handing the bundle to `upload-artifact` instead is not an
   option: that action's zip drops the executable bit and the bundle symlinks. Artifacts are always
   delivered inside GitHub's own zip, so a downloader unwraps that before the DMG.
-  The step summary carries the `xattr -dr com.apple.quarantine` line an unnotarized build needs.
+  The step summary carries the quarantine-stripping line an unnotarized build needs, spelled
+  `find … -exec xattr -d com.apple.quarantine {} \;`: the current `/usr/bin/xattr` replaced the
+  removed python one and has no `-r`, so the usual `xattr -dr` fails outright on macOS 26.
 - It creates no release and pushes no tag. Signed releases are local (`.claude/rules/release.md`),
   and a workflow publishing to the same tag would collide with `release.sh`.

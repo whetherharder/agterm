@@ -70,13 +70,17 @@ jobs:
           scripts/dmg.sh build/DerivedData/Build/Products/Release/agterm.app \
             "build/agterm-$version-universal.dmg"
           cat >>"$GITHUB_STEP_SUMMARY" <<'EOF'
-          Unzip the artifact, open the `.dmg`, and drag `agterm.app` to Applications. The build is
-          ad-hoc signed and not notarized, so macOS blocks the first launch until the quarantine
-          attribute is removed:
+          Unzip the artifact, open the `.dmg`, and drag `agterm.app` to Applications — the `.dmg` is
+          the disk image, not the app. The build is ad-hoc signed and not notarized, so macOS blocks
+          the first launch until the quarantine attribute is gone:
 
           ```sh
-          xattr -dr com.apple.quarantine /Applications/agterm.app
+          find /Applications/agterm.app -exec xattr -d com.apple.quarantine {} \; 2>/dev/null
           ```
+
+          `xattr -dr` is the older spelling: the current `/usr/bin/xattr` is a rewrite of the removed
+          python one and dropped `-r`. `2>/dev/null` swallows the files that never carried the
+          attribute.
           EOF
       - uses: actions/upload-artifact@v4
         with:
