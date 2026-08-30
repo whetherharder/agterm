@@ -80,9 +80,13 @@ paths:
 
 ## On-demand universal build (`universal-build.yml`)
 
-- `workflow_dispatch` only, and it gates nothing: it exists to hand out a bundle that runs on Intel
-  as well as Apple Silicon, which no `ci.yml` job produces. GitHub retired its Intel macOS runners,
-  so `AGTERM_UNIVERSAL=1` cross-compiles the x86_64 slice from the same `macos-26` arm64 runner.
+- Gates nothing: it exists to hand out a bundle that runs on Intel as well as Apple Silicon, which
+  no `ci.yml` job produces. GitHub retired its Intel macOS runners, so `AGTERM_UNIVERSAL=1`
+  cross-compiles the x86_64 slice from the same `macos-26` arm64 runner.
+- Two ways in: `workflow_dispatch`, and a push to `build/**`. The push route is what an automation
+  holding no `actions: write` uses — `git push origin HEAD:build/universal` asks for a build — and it
+  keeps these runs off `master`, whose every push already costs a full `ci.yml`. Nothing else watches
+  that namespace, so those branches carry no meaning beyond "build this commit".
 - Its libghostty cache key carries `universal`: the `ci.yml` key names only `runner.arch`, and the
   two runners agree on that while their staged xcframeworks hold different slices. `setup.sh` would
   catch the mismatch and rebuild, but the job could never write its own entry back.

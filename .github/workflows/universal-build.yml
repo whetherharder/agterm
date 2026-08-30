@@ -2,13 +2,19 @@ name: universal build
 
 # Not part of CI: an on-demand build of one bundle that runs on both Apple Silicon and Intel.
 # GitHub has no Intel macOS runners left, so the x86_64 slice is cross-compiled — zig builds both
-# libghostty slices and Xcode both app slices, from the same arm64 runner. It is manual because it
-# pays for a second libghostty build and produces a download, not a check.
+# libghostty slices and Xcode both app slices, from the same arm64 runner. It stays out of CI
+# because it pays for a second libghostty build and produces a download, not a check.
 #
 # The result is ad-hoc signed, not notarized: strip the quarantine attribute after unzipping.
 # Signed releases stay local; see `.claude/rules/release.md`.
 on:
   workflow_dispatch:
+  # `build/**` exists to start this by hand from a terminal: pushing a commit there is a request for
+  # a bundle, and nothing else watches those branches. Keeps `master` free of 25-minute runs it does
+  # not need, and gives anyone without permission to dispatch a workflow a way to ask for one.
+  push:
+    branches:
+      - "build/**"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

@@ -29,7 +29,7 @@ It builds `GhosttyKit.xcframework` and the ghostty resources from upstream ghost
 
 Both Apple Silicon and Intel Macs build: libghostty and the app are built for the Mac you build on, and nothing in the tree assumes an architecture. `AGTERM_UNIVERSAL=1` builds both slices instead — `AGTERM_UNIVERSAL=1 make release` (or `make dist`) produces one bundle that runs on either, at the cost of a second libghostty build. Switching between the two restages `GhosttyKit.xcframework`; the pre-built releases stay Apple Silicon.
 
-Without a local toolchain, run the **universal build** workflow from the Actions tab (or `gh workflow run universal-build.yml`) and download its artifact. That build is ad-hoc signed rather than notarized, so it needs `xattr -dr com.apple.quarantine /Applications/agterm.app` before the first launch.
+Without a local toolchain, run the **universal build** workflow from the Actions tab (or `gh workflow run universal-build.yml`, or `git push origin HEAD:build/universal`) and download its artifact. That build is ad-hoc signed rather than notarized, so it needs `xattr -dr com.apple.quarantine /Applications/agterm.app` before the first launch.
 
 After that:
 
