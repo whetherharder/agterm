@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build libghostty (GhosttyKit.xcframework) and ghostty resources from upstream ghostty source.
+# Build pinned libghostty and zmx artifacts from upstream source.
 #
 # We build from source rather than downloading a prebuilt artifact so the toolchain is fully
-# self-owned: the only inputs are upstream ghostty-org/ghostty at a pinned SHA, zig, and Xcode's
-# Metal Toolchain. No third-party fork, no daily-build release that can be pruned.
+# self-owned: the inputs are pinned upstream revisions, zig, and Xcode's Metal Toolchain. No fork or
+# daily-build release is involved; zmx takes the patches in scripts/zmx-patches over its plain pin.
 #
 # GHOSTTY_REV is a plain pin for reproducibility, not a workaround. It was held at a 2026-04-30
 # pre-regression commit while later builds blanked the scrollback on a font-size increase; that is
@@ -19,6 +19,10 @@ cd "$(dirname "$0")/.."
 
 GHOSTTY_REPO="https://github.com/ghostty-org/ghostty"
 GHOSTTY_REV="683d8db643b95cf229bfb5fe9fab9ae677920343"  # 2026-08-25
+ZMX_REPO="https://github.com/neurosnap/zmx"
+ZMX_REV="8bab1f0173b07e79835ea372d749af3dbf0d0842"  # v0.8.1, 2026-09-05
+# zig defaults to the builder's OS version and CPU; ship the app's macOS 14 baseline for each arch it links.
+ZMX_OS="macos.14.0"
 # ghostty pins minimum_zig_version 0.16.0. Name the MINOR LINE, not `zig`: that one rolls, so a fresh
 # build once 0.17 is current would compile a fixed GHOSTTY_REV with a compiler it never supported. Today
 # `zig@0.16` is still an alias for `zig`, so this buys nothing yet — it claims the name Homebrew uses when
@@ -34,10 +38,24 @@ else
   XCFRAMEWORK_TARGET=native
   WANT_ARCHS=("$(uname -m)")
 fi
+ZMX_TARGETS=()
+for arch in "${WANT_ARCHS[@]}"; do
+  case "$arch" in
+    arm64) ZMX_TARGETS+=("aarch64-$ZMX_OS") ;;
+    *) ZMX_TARGETS+=("$arch-$ZMX_OS") ;;
+  esac
+done
 # terminfo/ is the marker: it must extract as a SIBLING of ghostty/ so libghostty's
 # TERMINFO=dirname(GHOSTTY_RESOURCES_DIR)/terminfo derivation resolves xterm-ghostty.
 RESOURCES_MARKER="agterm/Resources/terminfo"
 STAMP_FILE=".ghostty-build-stamp"
+ZMX_STAGE_DIR="agterm/Resources/zmx"
+ZMX_STAMP_FILE=".zmx-build-stamp"
+# applied in name order over the plain pin; scripts/zmx-patches/README.md says what each one is for.
+# The stamp carries their digest, so editing a patch rebuilds zmx exactly as a ZMX_REV change does.
+ZMX_PATCH_DIR="scripts/zmx-patches"
+ZMX_PATCH_DIGEST="$(cat "$ZMX_PATCH_DIR"/*.patch | shasum -a 256 | cut -c1-16)"
+ZMX_STAMP="$ZMX_REV ${ZMX_TARGETS[*]} $ZMX_PATCH_DIGEST"
 
 # stage agterm's own bundled theme(s) from the committed source into the (gitignored,
 # setup-regenerated) ghostty themes dir. idempotent and called on both the cached and the
@@ -50,8 +68,13 @@ stage_custom_themes() {
 
 need_xc=true
 need_res=true
+need_zmx=true
 [[ -d "$XCFRAMEWORK_DIR" ]] && need_xc=false
 [[ -d "$RESOURCES_MARKER" ]] && need_res=false
+if [[ -x "$ZMX_STAGE_DIR/zmx" && -f "$ZMX_STAGE_DIR/LICENSE" && -f "$ZMX_STAMP_FILE" ]] &&
+   [[ "$(cat "$ZMX_STAMP_FILE")" == "$ZMX_STAMP" ]]; then
+  need_zmx=false
+fi
 
 # a stale stamp restages BOTH: they come out of one build, and an artifact built from another revision
 # cannot be told apart from a current one.
@@ -74,8 +97,8 @@ if ! $need_xc; then
   fi
 fi
 
-if ! $need_xc && ! $need_res; then
-  echo "GhosttyKit and resources already present"
+if ! $need_xc && ! $need_res && ! $need_zmx; then
+  echo "GhosttyKit, resources and zmx already present"
   stage_custom_themes
   exit 0
 fi
@@ -89,39 +112,124 @@ if [[ ! -x "$ZIG" ]]; then
   ZIG="$(brew --prefix "$ZIG_FORMULA")/bin/zig"
 fi
 
-# Metal Toolchain — the xcframework build compiles ghostty's Metal shaders
-if ! xcrun metal --version >/dev/null 2>&1; then
+# The macOS 27 SDK's math.h asks the compiler's float.h for INFINITY/NAN through clang's
+# `__need_infinity_nan` protocol (LLVM PR #164348, Apple clang 21). Zig 0.16's bundled float.h does not
+# implement it, so compiling zig's libc++ fails with "undeclared identifier 'INFINITY'". Both builds link
+# libc++, but libghostty compiles against Ghostty's own apple-sdk math.h overlay and zmx's exported VT
+# dependency path does not, which is why only the zmx build needs this. A shim for the two macros, not a
+# backport of LLVM 22's header split: remove it once ZIG_FORMULA resolves to a release carrying zig's own
+# fix (master has it in 520af696).
+SHIM_MARK='Local patch (agterm scripts/setup.sh)'
+patch_zig_float_h() {
+  local zig_lib float_h source tmp
+  zig_lib="$("$ZIG" env | sed -n 's/.*lib_dir"\{0,1\} *[=:] *"\([^"]*\)".*/\1/p')"
+  float_h="$zig_lib/include/float.h"
+  if [[ ! -f "$float_h" ]]; then
+    echo "warning: zig float.h not found at $float_h; skipping __need_infinity_nan shim" >&2
+    return 0
+  fi
+  # upstream's own implementation carries no marker of ours, and must never be replaced by the shim or
+  # by a stale backup taken before the keg gained it
+  if grep -q '__need_infinity_nan' "$float_h" && ! grep -qF "$SHIM_MARK" "$float_h"; then
+    echo "zig float.h implements __need_infinity_nan upstream; no shim needed"
+    return 0
+  fi
+  # both of our markers, so an interrupted run is re-derived rather than mistaken for a finished one
+  if grep -qF "$SHIM_MARK" "$float_h" && grep -q '#endif /\* __need_infinity_nan \*/' "$float_h"; then
+    echo "zig float.h already carries the __need_infinity_nan shim"
+    return 0
+  fi
+  # only a half-applied shim of ours may fall back to the backup it was taken from
+  source="$float_h"
+  if grep -qF "$SHIM_MARK" "$float_h" && [[ -f "$float_h.orig" ]]; then
+    source="$float_h.orig"
+  fi
+  tmp="$(mktemp "$float_h.XXXXXX")"
+  perl -0pe 's|^#ifndef __CLANG_FLOAT_H\n#define __CLANG_FLOAT_H\n|/* Local patch (agterm scripts/setup.sh): honor the macOS 27 SDK\n * __need_infinity_nan protocol (LLVM PR #164348). */\n#if defined(__need_infinity_nan)\n#  undef INFINITY\n#  undef NAN\n#  define INFINITY (__builtin_inff())\n#  define NAN (__builtin_nanf(""))\n#  undef __need_infinity_nan\n#else\n\n#ifndef __CLANG_FLOAT_H\n#define __CLANG_FLOAT_H\n|m' "$source" > "$tmp"
+  printf '#endif /* __need_infinity_nan */\n' >> "$tmp"
+  # publish only a header that got the whole transformation: the substitution is silent when the guard
+  # lines are spaced differently, and appending the closing #endif alone would corrupt the header
+  if ! grep -q '^#if defined(__need_infinity_nan)$' "$tmp" || ! grep -q '^#ifndef __CLANG_FLOAT_H$' "$tmp"; then
+    rm -f "$tmp"
+    echo "warning: zig float.h not in the expected form; skipping __need_infinity_nan shim" >&2
+    return 0
+  fi
+  chmod u+w "$float_h"
+  [[ -f "$float_h.orig" ]] || cp -p "$float_h" "$float_h.orig"
+  chmod --reference="$float_h" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+  mv "$tmp" "$float_h"
+  echo "shimmed zig float.h for the macOS 27 SDK: $float_h (backup: $float_h.orig)"
+}
+
+# Metal Toolchain is needed only when the xcframework build runs.
+if { $need_xc || $need_res; } && ! xcrun metal --version >/dev/null 2>&1; then
   echo "downloading Xcode Metal Toolchain (one-time)..."
   xcodebuild -downloadComponent MetalToolchain
 fi
 
-# fetch ghostty at the pinned commit (shallow, single commit, no submodules — not needed here)
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
-echo "fetching ghostty $GHOSTTY_REV..."
-git init -q "$BUILD_DIR"
-git -C "$BUILD_DIR" remote add origin "$GHOSTTY_REPO"
-git -C "$BUILD_DIR" fetch -q --depth 1 origin "$GHOSTTY_REV"
-git -C "$BUILD_DIR" -c advice.detachedHead=false checkout -q FETCH_HEAD
 
-echo "building GhosttyKit.xcframework ($XCFRAMEWORK_TARGET) with zig (a few minutes)..."
-( cd "$BUILD_DIR" && "$ZIG" build -Doptimize=ReleaseFast -Demit-xcframework=true -Dxcframework-target="$XCFRAMEWORK_TARGET" -Demit-macos-app=false )
+if $need_xc || $need_res; then
+  ghostty_build="$BUILD_DIR/ghostty"
+  echo "fetching ghostty $GHOSTTY_REV..."
+  git init -q "$ghostty_build"
+  git -C "$ghostty_build" remote add origin "$GHOSTTY_REPO"
+  git -C "$ghostty_build" fetch -q --depth 1 origin "$GHOSTTY_REV"
+  git -C "$ghostty_build" -c advice.detachedHead=false checkout -q FETCH_HEAD
 
-if $need_xc; then
-  echo "staging GhosttyKit.xcframework..."
-  rm -rf "$XCFRAMEWORK_DIR"
-  cp -R "$BUILD_DIR/macos/GhosttyKit.xcframework" "$XCFRAMEWORK_DIR"
+  echo "building GhosttyKit.xcframework ($XCFRAMEWORK_TARGET) with zig (a few minutes)..."
+  ( cd "$ghostty_build" && "$ZIG" build -Doptimize=ReleaseFast -Demit-xcframework=true \
+      -Dxcframework-target="$XCFRAMEWORK_TARGET" -Demit-macos-app=false )
+
+  if $need_xc; then
+    echo "staging GhosttyKit.xcframework..."
+    rm -rf "$XCFRAMEWORK_DIR"
+    cp -R "$ghostty_build/macos/GhosttyKit.xcframework" "$XCFRAMEWORK_DIR"
+  fi
+
+  if $need_res; then
+    echo "staging ghostty resources..."
+    rm -rf agterm/Resources/ghostty agterm/Resources/terminfo
+    mkdir -p agterm/Resources/ghostty
+    cp -R "$ghostty_build/zig-out/share/ghostty/shell-integration" agterm/Resources/ghostty/
+    cp -R "$ghostty_build/zig-out/share/ghostty/themes" agterm/Resources/ghostty/
+    cp -R "$ghostty_build/zig-out/share/terminfo" agterm/Resources/terminfo
+  fi
+  printf '%s\n' "$GHOSTTY_REV" > "$STAMP_FILE"
 fi
 
-if $need_res; then
-  echo "staging ghostty resources..."
-  rm -rf agterm/Resources/ghostty agterm/Resources/terminfo
-  mkdir -p agterm/Resources/ghostty
-  cp -R "$BUILD_DIR/zig-out/share/ghostty/shell-integration" agterm/Resources/ghostty/
-  cp -R "$BUILD_DIR/zig-out/share/ghostty/themes" agterm/Resources/ghostty/
-  cp -R "$BUILD_DIR/zig-out/share/terminfo" agterm/Resources/terminfo
+if $need_zmx; then
+  zmx_build="$BUILD_DIR/zmx"
+  echo "fetching zmx $ZMX_REV..."
+  git init -q "$zmx_build"
+  git -C "$zmx_build" remote add origin "$ZMX_REPO"
+  git -C "$zmx_build" fetch -q --depth 1 origin "$ZMX_REV"
+  git -C "$zmx_build" -c advice.detachedHead=false checkout -q FETCH_HEAD
+  for zmx_patch in "$ZMX_PATCH_DIR"/*.patch; do
+    echo "applying $(basename "$zmx_patch")..."
+    git -C "$zmx_build" apply --whitespace=nowarn "$PWD/$zmx_patch"
+  done
+
+  patch_zig_float_h
+
+  zmx_slices=()
+  for zmx_target in "${ZMX_TARGETS[@]}"; do
+    echo "building zmx for $zmx_target with zig..."
+    ( cd "$zmx_build" && "$ZIG" build -Doptimize=ReleaseSafe -Dtarget="$zmx_target" --prefix "out/$zmx_target" )
+    zmx_slices+=("$zmx_build/out/$zmx_target/bin/zmx")
+  done
+  rm -rf "$ZMX_STAGE_DIR"
+  mkdir -p "$ZMX_STAGE_DIR"
+  if (( ${#zmx_slices[@]} == 1 )); then
+    install -m 0755 "${zmx_slices[0]}" "$ZMX_STAGE_DIR/zmx"
+  else
+    lipo -create -output "$ZMX_STAGE_DIR/zmx" "${zmx_slices[@]}"
+    chmod 0755 "$ZMX_STAGE_DIR/zmx"
+  fi
+  cp "$zmx_build/LICENSE" "$ZMX_STAGE_DIR/LICENSE"
+  printf '%s\n' "$ZMX_STAMP" > "$ZMX_STAMP_FILE"
 fi
 
 stage_custom_themes
-printf '%s\n' "$GHOSTTY_REV" > "$STAMP_FILE"
 echo "setup complete"

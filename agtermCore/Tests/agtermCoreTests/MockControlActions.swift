@@ -31,51 +31,73 @@ final class MockControlActions: ControlActions {
         case workspaceFilter(window: String?, ControlToggleMode)
         case workspaceExpansion(target: String?, window: String?, expanded: Bool)
         case sessionFlag(target: String?, window: String?, String?)
+        case sessionContext(target: String?, window: String?, context: String?)
         case markSessionSeen(target: String?, window: String?)
         case sessionStatus(target: String?, window: String?, ControlSessionStatusUpdate)
         case sessionRestore(target: String?, window: String?, ControlSessionRestoreUpdate)
         case sessionSplit(target: String?, window: String?, String?, SplitAxis?)
         case sessionSplitClose(target: String?, window: String?)
+        case sessionSwap(target: String?, window: String?)
+        case sessionLead(target: String?, window: String?, pane: StatusPane?)
         case sessionScratch(target: String?, window: String?, String?, command: String?)
         case sessionFocus(target: String?, window: String?, String?)
         case sessionResize(target: String?, window: String?, ControlSplitResize)
         case surfaceZoom(target: String?, window: String?, ControlToggleMode)
         case surfaceCursor(target: String?, window: String?)
         case dashboard(targets: [String], window: String?, close: Bool, fontMode: DashboardFontMode, mru: Bool)
-        case font(target: String?, window: String?, pane: String?, String)
+        case font(target: String?, window: String?, pane: StatusPane?, String)
         case keymapReload
         case keymapList
+        case hooksReload
+        case hooksList
         case version
         case configReload
         case notify(target: String?, window: String?, title: String?, body: String)
         case themeSet(String?)
         case themeList
+        case restoreModeRead
+        case restoreModeSet(RestoreMode)
+        case zmxList
+        case zmxPrune
+        case zmxKill(target: String, window: String?, pane: ZmxPaneRole)
+        case zmxReset
+        case zmxTree(host: String?)
+        case zmxAttach(host: String, session: String)
+        case zmxPresent(session: String)
+        case claimOverlayJob(String)
         case sidebarVisibility(ControlToggleMode)
         case sidebarViewMode(ControlSidebarViewMode)
+        case flaggedViewLayout(ControlFlaggedLayoutMode)
         case expand(window: String?)
         case collapse(window: String?)
+        case sidebarWidth(points: Double, window: String?)
         case quick(String?)
         case quickType(text: String)
         case quickText(all: Bool, lines: Int?)
         case sessionType(target: String?, window: String?, ControlSessionTypeOptions)
         case sessionCopy(target: String?, window: String?)
-        case sessionPaste(target: String?, window: String?)
+        case sessionPaste(target: String?, window: String?, pane: StatusPane?)
         case sessionSelectAll(target: String?, window: String?)
         case sessionSearch(target: String?, window: String?, text: String?, to: String?)
         case overlayOpen(target: String?, window: String?, ControlSessionOverlayOpenOptions)
         case overlayClose(target: String?, window: String?, pane: OverlayPane?)
+        case overlayReload(target: String?, window: String?, pane: OverlayPane?, current: Bool)
+        case overlayNavigate(target: String?, window: String?, pane: OverlayPane?, HtmlNavigation)
         case overlayResize(target: String?, window: String?, sizePercent: Int?)
         case overlayResult(target: String?, window: String?, pane: OverlayPane?)
+        case overlaySubmit(target: String?, window: String?, pane: OverlayPane?, value: String)
+        case pageResult(UUID)
         case overlayCopy(target: String?, window: String?, pane: OverlayPane?)
         case overlayText(target: String?, window: String?, ControlSessionOverlayTextOptions)
-        case hudOpen(target: String?, window: String?, HudSpec)
-        case hudUpdate(target: String?, window: String?, HudSpec)
+        case hudOpen(target: String?, window: String?, HudSpec, ControlHudPlacement)
+        case hudUpdate(target: String?, window: String?, HudSpec, ControlHudPlacement)
         case hudClose(target: String?, window: String?)
         case sessionBackground(target: String?, window: String?, ControlSessionBackgroundOptions)
         case sessionText(target: String?, window: String?, ControlSessionTextOptions)
         case windowNew(String?, minimized: Bool)
         case windowList
         case windowSelect(target: String?)
+        case windowGo(WorkspaceNavigation)
         case windowClose(target: String?)
         case windowRename(target: String?, String)
         case windowDelete(target: String?)
@@ -87,6 +109,9 @@ final class MockControlActions: ControlActions {
         case pickOpen(PendingPick, window: String?, follow: Bool)
         case pickResult(target: String, window: String?)
         case pickCancel(target: String, window: String?)
+        case askOpen(PendingAsk, target: String?, window: String?, placement: ControlAskPlacement, follow: Bool)
+        case askResult(target: String, window: String?)
+        case askCancel(target: String, window: String?)
         case restoreClear
         case restoreCapture
     }
@@ -109,16 +134,27 @@ final class MockControlActions: ControlActions {
     var unresolvedFocusTargets: [String] = []
     var nextSidebarVisibilityResponse = ControlResponse(ok: true)
     var nextSidebarViewModeResponse = ControlResponse(ok: true)
+    var nextFlaggedViewLayoutResponse = ControlResponse(ok: true)
     var nextExpandResponse = ControlResponse(ok: true)
     var nextCollapseResponse = ControlResponse(ok: true)
+    var nextSidebarWidthResponse = ControlResponse(ok: true)
     var nextFontResponse = ControlResponse(ok: true)
     var nextNotifyResponse = ControlResponse(ok: true)
     var nextKeymapListResponse = ControlResponse(ok: true)
+    var nextHooksReloadResponse = ControlResponse(ok: true)
+    var nextHooksListResponse = ControlResponse(ok: true)
     var nextVersionResponse = ControlResponse(ok: true)
     var nextKeymapResponse = ControlResponse(ok: true)
     var nextConfigResponse = ControlResponse(ok: true)
     var nextThemeSetResponse = ControlResponse(ok: true)
     var nextThemeListResponse = ControlResponse(ok: true)
+    var nextRestoreModeResponse = ControlResponse(ok: true)
+    var nextZmxListResponse = ControlResponse(ok: true)
+    var nextZmxPruneResponse = ControlResponse(ok: true)
+    var nextZmxKillResponse = ControlResponse(ok: true)
+    var nextZmxResetResponse = ControlResponse(ok: true)
+    var nextRemoteTreeResponse = ControlResponse(ok: true)
+    var nextRemoteAttachResponse = ControlResponse(ok: true)
     var nextQuickResponse = ControlResponse(ok: true)
     var nextQuickTypeResponse = ControlResponse(ok: true)
     var nextQuickTextResponse = ControlResponse(ok: true)
@@ -144,6 +180,7 @@ final class MockControlActions: ControlActions {
     var nextWindowNewResponse = ControlResponse(ok: true)
     var nextWindowListResponse = ControlResponse(ok: true)
     var nextWindowSelectResponse = ControlResponse(ok: true)
+    var nextWindowGoResponse = ControlResponse(ok: true)
     var nextWindowCloseResponse = ControlResponse(ok: true)
     var nextWindowRenameResponse = ControlResponse(ok: true)
     var nextWindowDeleteResponse = ControlResponse(ok: true)
@@ -155,9 +192,13 @@ final class MockControlActions: ControlActions {
     var nextPickOpenResponse = ControlResponse(ok: true)
     var nextPickResultResponse = ControlResponse(ok: true)
     var nextPickCancelResponse = ControlResponse(ok: true)
+    var nextAskOpenResponse = ControlResponse(ok: true)
+    var nextAskResultResponse = ControlResponse(ok: true)
+    var nextAskCancelResponse = ControlResponse(ok: true)
     var nextRestoreClearResponse = ControlResponse(ok: true)
     var nextRestoreCaptureResponse = ControlResponse(ok: true)
     var nextSessionRestoreResponse = ControlResponse(ok: true)
+    var nextSessionSwapResponse = ControlResponse(ok: true)
 
     func controlTree(window: String?) -> ControlResponse {
         calls.append(.tree(window: window))
@@ -278,6 +319,11 @@ final class MockControlActions: ControlActions {
         return ControlResponse(ok: true)
     }
 
+    func setSessionContext(_ target: String?, window: String?, context: String?) -> ControlResponse {
+        calls.append(.sessionContext(target: target, window: window, context: context))
+        return ControlResponse(ok: true)
+    }
+
     func markSessionSeen(_ target: String?, window: String?) -> ControlResponse {
         calls.append(.markSessionSeen(target: target, window: window))
         return ControlResponse(ok: true)
@@ -307,6 +353,16 @@ final class MockControlActions: ControlActions {
     func closeSessionSplit(_ target: String?, window: String?) -> ControlResponse {
         calls.append(.sessionSplitClose(target: target, window: window))
         return ControlResponse(ok: true)
+    }
+
+    func swapSessionPanes(_ target: String?, window: String?) async -> ControlResponse {
+        calls.append(.sessionSwap(target: target, window: window))
+        return nextSessionSwapResponse
+    }
+
+    func takeSessionLead(_ target: String?, window: String?, pane: StatusPane?) -> ControlResponse {
+        calls.append(.sessionLead(target: target, window: window, pane: pane))
+        return ControlResponse(ok: true, result: ControlResult(id: "session-id"))
     }
 
     func scratchSession(_ target: String?, window: String?, mode: String?,
@@ -341,7 +397,7 @@ final class MockControlActions: ControlActions {
         return nextDashboardResponse
     }
 
-    func font(_ target: String?, window: String?, pane: String?, action: String) -> ControlResponse {
+    func font(_ target: String?, window: String?, pane: StatusPane?, action: String) -> ControlResponse {
         calls.append(.font(target: target, window: window, pane: pane, action))
         return nextFontResponse
     }
@@ -354,6 +410,16 @@ final class MockControlActions: ControlActions {
     func listKeymap() -> ControlResponse {
         calls.append(.keymapList)
         return nextKeymapListResponse
+    }
+
+    func reloadHooks() -> ControlResponse {
+        calls.append(.hooksReload)
+        return nextHooksReloadResponse
+    }
+
+    func listHooks() -> ControlResponse {
+        calls.append(.hooksList)
+        return nextHooksListResponse
     }
 
     func appIdentity() -> ControlResponse {
@@ -382,6 +448,56 @@ final class MockControlActions: ControlActions {
         return nextThemeListResponse
     }
 
+    func readRestoreMode() -> ControlResponse {
+        calls.append(.restoreModeRead)
+        return nextRestoreModeResponse
+    }
+
+    func setRestoreMode(_ mode: RestoreMode) -> ControlResponse {
+        calls.append(.restoreModeSet(mode))
+        return nextRestoreModeResponse
+    }
+
+    func listZmxDaemons() -> ControlResponse {
+        calls.append(.zmxList)
+        return nextZmxListResponse
+    }
+
+    func pruneZmxDaemons() -> ControlResponse {
+        calls.append(.zmxPrune)
+        return nextZmxPruneResponse
+    }
+
+    func killZmxDaemon(target: String, window: String?, pane: ZmxPaneRole) -> ControlResponse {
+        calls.append(.zmxKill(target: target, window: window, pane: pane))
+        return nextZmxKillResponse
+    }
+
+    func resetLiveSessions() -> ControlResponse {
+        calls.append(.zmxReset)
+        return nextZmxResetResponse
+    }
+
+    func remoteTree(host: String?) async -> ControlResponse {
+        calls.append(.zmxTree(host: host))
+        return nextRemoteTreeResponse
+    }
+
+    func openPresentation(session: String) -> ControlResponse {
+        calls.append(.zmxPresent(session: session))
+        return ControlResponse(ok: true, result: ControlResult(id: session))
+    }
+
+    func claimOverlayJob(_ job: String) -> ControlResponse {
+        calls.append(.claimOverlayJob(job))
+        return ControlResponse(ok: true, result: ControlResult(id: job))
+    }
+
+    func attachRemoteSession(host: String, session: String) async -> ControlResponse {
+        calls.append(.zmxAttach(host: host, session: session))
+        return nextRemoteAttachResponse
+    }
+
     func setSidebarVisibility(_ mode: ControlToggleMode) -> ControlResponse {
         calls.append(.sidebarVisibility(mode))
         return nextSidebarVisibilityResponse
@@ -392,6 +508,11 @@ final class MockControlActions: ControlActions {
         return nextSidebarViewModeResponse
     }
 
+    func setFlaggedViewLayout(_ mode: ControlFlaggedLayoutMode) -> ControlResponse {
+        calls.append(.flaggedViewLayout(mode))
+        return nextFlaggedViewLayoutResponse
+    }
+
     func expandSidebar(window: String?) -> ControlResponse {
         calls.append(.expand(window: window))
         return nextExpandResponse
@@ -400,6 +521,11 @@ final class MockControlActions: ControlActions {
     func collapseSidebar(window: String?) -> ControlResponse {
         calls.append(.collapse(window: window))
         return nextCollapseResponse
+    }
+
+    func setSidebarWidth(_ points: Double, window: String?) -> ControlResponse {
+        calls.append(.sidebarWidth(points: points, window: window))
+        return nextSidebarWidthResponse
     }
 
     func setQuickTerminal(mode: String?) -> ControlResponse {
@@ -428,8 +554,8 @@ final class MockControlActions: ControlActions {
         return nextSessionCopyResponse
     }
 
-    func pasteSession(_ target: String?, window: String?) -> ControlResponse {
-        calls.append(.sessionPaste(target: target, window: window))
+    func pasteSession(_ target: String?, window: String?, pane: StatusPane?) -> ControlResponse {
+        calls.append(.sessionPaste(target: target, window: window, pane: pane))
         return nextSessionPasteResponse
     }
 
@@ -450,6 +576,17 @@ final class MockControlActions: ControlActions {
         return nextOverlayOpenResponse
     }
 
+    func reloadSessionOverlay(_ target: String?, window: String?, pane: OverlayPane?, current: Bool) -> ControlResponse {
+        calls.append(.overlayReload(target: target, window: window, pane: pane, current: current))
+        return ControlResponse(ok: true)
+    }
+
+    func navigateSessionOverlay(_ target: String?, window: String?, pane: OverlayPane?,
+                                navigation: HtmlNavigation) -> ControlResponse {
+        calls.append(.overlayNavigate(target: target, window: window, pane: pane, navigation))
+        return ControlResponse(ok: true)
+    }
+
     func closeSessionOverlay(_ target: String?, window: String?, pane: OverlayPane?) -> ControlResponse {
         calls.append(.overlayClose(target: target, window: window, pane: pane))
         return nextOverlayCloseResponse
@@ -465,6 +602,16 @@ final class MockControlActions: ControlActions {
         return nextOverlayResultResponse
     }
 
+    func submitSessionOverlay(_ target: String?, window: String?, pane: OverlayPane?, value: String) -> ControlResponse {
+        calls.append(.overlaySubmit(target: target, window: window, pane: pane, value: value))
+        return ControlResponse(ok: true)
+    }
+
+    func htmlPageResult(_ pageID: UUID) -> ControlResponse {
+        calls.append(.pageResult(pageID))
+        return ControlResponse(ok: true)
+    }
+
     func copySessionOverlaySelection(_ target: String?, window: String?, pane: OverlayPane?) -> ControlResponse {
         calls.append(.overlayCopy(target: target, window: window, pane: pane))
         return nextOverlayCopyResponse
@@ -477,12 +624,22 @@ final class MockControlActions: ControlActions {
     }
 
     func openHud(_ target: String?, window: String?, spec: HudSpec) -> ControlResponse {
-        calls.append(.hudOpen(target: target, window: window, spec))
+        openHud(target, window: window, spec: spec, placement: ControlHudPlacement())
+    }
+
+    func openHud(_ target: String?, window: String?, spec: HudSpec,
+                 placement: ControlHudPlacement) -> ControlResponse {
+        calls.append(.hudOpen(target: target, window: window, spec, placement))
         return nextHudOpenResponse
     }
 
     func updateHud(_ target: String?, window: String?, spec: HudSpec) -> ControlResponse {
-        calls.append(.hudUpdate(target: target, window: window, spec))
+        updateHud(target, window: window, spec: spec, placement: ControlHudPlacement())
+    }
+
+    func updateHud(_ target: String?, window: String?, spec: HudSpec,
+                   placement: ControlHudPlacement) -> ControlResponse {
+        calls.append(.hudUpdate(target: target, window: window, spec, placement))
         return nextHudUpdateResponse
     }
 
@@ -515,6 +672,11 @@ final class MockControlActions: ControlActions {
     func windowSelect(_ target: String?) async -> ControlResponse {
         calls.append(.windowSelect(target: target))
         return nextWindowSelectResponse
+    }
+
+    func windowGo(direction: WorkspaceNavigation) -> ControlResponse {
+        calls.append(.windowGo(direction))
+        return nextWindowGoResponse
     }
 
     func windowClose(_ target: String?) async -> ControlResponse {
@@ -570,6 +732,22 @@ final class MockControlActions: ControlActions {
     func cancelPick(_ target: String, window: String?) -> ControlResponse {
         calls.append(.pickCancel(target: target, window: window))
         return nextPickCancelResponse
+    }
+
+    func openAsk(_ ask: PendingAsk, target: String?, window: String?,
+                 placement: ControlAskPlacement, follow: Bool) -> ControlResponse {
+        calls.append(.askOpen(ask, target: target, window: window, placement: placement, follow: follow))
+        return nextAskOpenResponse
+    }
+
+    func askResult(_ target: String, window: String?) -> ControlResponse {
+        calls.append(.askResult(target: target, window: window))
+        return nextAskResultResponse
+    }
+
+    func cancelAsk(_ target: String, window: String?) -> ControlResponse {
+        calls.append(.askCancel(target: target, window: window))
+        return nextAskCancelResponse
     }
 
     func clearRestoreCommands() -> ControlResponse {

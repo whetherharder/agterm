@@ -6,6 +6,7 @@ extension WindowContentView {
     /// Restore keyboard ownership to whichever full-window cover was already present below a picker.
     /// The ordinary session focus helper intentionally refuses to cross these modal layers.
     func restoreFocusAfterPick() {
+        actions.resignDismissedFieldEditor(for: windowID)
         if dashboard.isOpen {
             dashboard.requestFocus()
             return
@@ -137,34 +138,37 @@ extension WindowContentView {
     }
 
     @ViewBuilder func zoomedSessionTerminal(session: Session, surface: TerminalZoomSurface) -> some View {
+        let hostToken = PaneHostIdentity.token(for: surface, in: session)
         switch surface {
         case .primary:
             TerminalView(session: session, surfaceKeyPath: \.surface, makeSurface: makeSurface,
                          isActive: true, deckVisible: true, reportsFocusChange: false)
-                .id("\(primarySurfaceID(session))-zoom")
+                .id("\(primarySurfaceID(session))-zoom-\(hostToken)")
+                .overlay { PaneLeadCover(session: session, pane: .left, background: terminalColor, foreground: chromeText) }
         case .split:
             TerminalView(session: session, surfaceKeyPath: \.splitSurface, makeSurface: makeSplitSurface,
                          isActive: true, deckVisible: true, reportsFocusChange: false)
-                .id("\(session.id.uuidString)-zoom-split")
+                .id("\(session.id.uuidString)-zoom-split-\(hostToken)")
+                .overlay { PaneLeadCover(session: session, pane: .right, background: terminalColor, foreground: chromeText) }
         case .scratch:
             TerminalView(session: session, surfaceKeyPath: \.scratchSurface, makeSurface: makeScratchSurface,
                          isActive: true, deckVisible: true, reportsFocusChange: false)
-                .id("\(session.id.uuidString)-zoom-scratch")
+                .id("\(session.id.uuidString)-zoom-scratch-\(hostToken)")
         case .overlay:
             TerminalView(session: session, surfaceKeyPath: \.overlaySurface,
                          makeSurface: { makeOverlaySurface($0, nil) },
                          isActive: true, deckVisible: true, reportsFocusChange: false)
-                .id("\(session.id.uuidString)-zoom-overlay")
+                .id("\(session.id.uuidString)-zoom-overlay-\(hostToken)")
         case .overlayLeft:
             TerminalView(session: session, surfaceKeyPath: \.leftOverlaySurface,
                          makeSurface: { makeOverlaySurface($0, .left) },
                          isActive: true, deckVisible: true, reportsFocusChange: false)
-                .id("\(session.id.uuidString)-zoom-overlay-left")
+                .id("\(session.id.uuidString)-zoom-overlay-left-\(hostToken)")
         case .overlayRight:
             TerminalView(session: session, surfaceKeyPath: \.rightOverlaySurface,
                          makeSurface: { makeOverlaySurface($0, .right) },
                          isActive: true, deckVisible: true, reportsFocusChange: false)
-                .id("\(session.id.uuidString)-zoom-overlay-right")
+                .id("\(session.id.uuidString)-zoom-overlay-right-\(hostToken)")
         }
     }
 
@@ -173,7 +177,7 @@ extension WindowContentView {
     /// machinery. The outer retry here only waits for a surface the zoom layer's `TerminalView` hasn't
     /// realized yet (e.g. zooming a never-shown scratch), and dies as soon as the zoom target changes.
     func focusZoomedSessionSurface(session: Session, surface: TerminalZoomSurface, attempt: Int = 0) {
-        guard pick.pending == nil else { return }
+        guard !pick.modalPending else { return }
         let expectedTarget = TerminalZoomTarget.session(session.id, surface)
         guard terminalZoom.target == expectedTarget else { return }
         if let view = surface.surface(in: session) as? GhosttySurfaceView {

@@ -4,6 +4,79 @@ import Testing
 
 @MainActor
 struct AppStorePaneTests {
+    @Test(arguments: OverlayPane.allCases, ["session", "left", "right"])
+    func paneCloseCancelsOnlyItsOwnAnchoredAsk(closingPane: OverlayPane, scope: String) throws {
+        let store = makeStore()
+        let workspace = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: workspace.id, cwd: "/tmp"))
+        session.surface = SpySurface()
+        store.toggleSplit(session.id)
+        session.splitSurface = SpySurface()
+        let identity = scope == "session" ? nil : (scope == "left" ? session.paneIdentity : session.splitPaneIdentity)
+        let ask = PendingAsk(id: UUID().uuidString, title: "Continue?", buttons: [ControlAskButton(id: "yes", label: "Yes")])
+        let windowID = UUID()
+        let registry = AskRegistry.shared
+        #expect(session.openAsk(ask, paneIdentity: identity))
+        #expect(registry.register(id: ask.id, owner: .session(session.id, window: windowID)))
+        defer { session.cancelAsk(id: ask.id) }
+
+        if closingPane == .left { store.closePrimaryPane(session.id) } else { store.closeSplit(session.id) }
+
+        #expect(store.session(withID: session.id) === session)
+        if scope == closingPane.rawValue {
+            #expect(session.askPending == nil)
+            #expect(session.askPaneIdentity == nil)
+            #expect(registry.result(for: ask.id)?.result == ControlAskResult(result: .cancelled))
+            #expect(registry.result(for: ask.id)?.windowID == windowID)
+        } else {
+            #expect(session.askPending == ask)
+            #expect(session.askPaneIdentity == identity)
+            #expect(session.askTargetPane == (scope == "session" ? nil : .left))
+            #expect(registry.owner(for: ask.id) == .session(session.id, window: windowID))
+        }
+    }
+
+    @Test func lastPrimaryPaneCloseCancelsTheSessionAsk() throws {
+        let store = makeStore()
+        let workspace = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: workspace.id, cwd: "/tmp"))
+        let ask = PendingAsk(id: UUID().uuidString, title: "Continue?", buttons: [ControlAskButton(id: "yes", label: "Yes")])
+        let windowID = UUID()
+        #expect(session.openAsk(ask))
+        #expect(AskRegistry.shared.register(id: ask.id, owner: .session(session.id, window: windowID)))
+        defer { session.cancelAsk(id: ask.id) }
+
+        store.closePrimaryPane(session.id)
+
+        #expect(store.session(withID: session.id) == nil)
+        #expect(session.askPending == nil)
+        #expect(AskRegistry.shared.result(for: ask.id)?.result.result == .cancelled)
+    }
+
+    @Test(arguments: OverlayPane.allCases)
+    func collapsingSplitKeepsAskWhetherItsPaneRemainsVisible(focusedPane: OverlayPane) throws {
+        let store = makeStore()
+        let workspace = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: workspace.id, cwd: "/tmp"))
+        session.surface = SpySurface()
+        store.toggleSplit(session.id)
+        session.splitSurface = SpySurface()
+        let identity = try #require(session.splitPaneIdentity)
+        let ask = PendingAsk(id: UUID().uuidString, title: "Continue?", buttons: [ControlAskButton(id: "yes", label: "Yes")])
+        #expect(session.openAsk(ask, paneIdentity: identity))
+        session.splitFocused = focusedPane == .right
+
+        store.toggleSplit(session.id)
+
+        #expect(session.rendersPane(.right) == (focusedPane == .right))
+        #expect(session.askPending == ask)
+        #expect(session.askPaneIdentity == identity)
+        store.toggleSplit(session.id)
+        #expect(session.rendersPane(.right))
+        #expect(session.askPending == ask)
+        #expect(session.askTargetPane == .right)
+    }
+
     // MARK: - split panes
 
     @Test func toggleSplitFlipsFlag() {
@@ -12,14 +85,18 @@ struct AppStorePaneTests {
         let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
         #expect(session.isSplit == false)
         #expect(session.hasSplit == false)
+        #expect(session.splitPaneIdentity == nil)
         store.toggleSplit(session.id)
         #expect(session.isSplit == true)
         #expect(session.hasSplit == true)
         #expect(session.splitFocused == true)  // opening focuses the new (right) pane
+        let identity = session.splitPaneIdentity
+        #expect(identity != nil)
         store.toggleSplit(session.id)
         #expect(session.isSplit == false)
         #expect(session.hasSplit == true)
         #expect(session.splitFocused == true)
+        #expect(session.splitPaneIdentity == identity)
     }
 
     @Test func controlTreeReportsHasSplitAcrossHide() throws {
@@ -119,6 +196,20 @@ struct AppStorePaneTests {
         #expect(session.pendingSplitForegroundCommand == nil)
     }
 
+    @Test func closeSplitDropsSplitCreationIdentity() {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        store.toggleSplit(session.id)
+        session.splitInitialCommand = "ssh split-host"
+        session.splitCommandWait = true
+
+        store.closeSplit(session.id)
+
+        #expect(session.splitInitialCommand == nil)
+        #expect(!session.splitCommandWait)
+    }
+
     @Test func closeSplitHidesAndTearsDownSurface() {
         let store = makeStore()
         let ws = store.addWorkspace(name: "work")
@@ -131,6 +222,7 @@ struct AppStorePaneTests {
         session.splitCwd = "/var/log"
         session.splitRatio = 0.7
         session.splitAxis = .topBottom
+        session.splitPaneIdentity = UUID()
         store.closeSplit(session.id)
         #expect(session.isSplit == false)
         #expect(session.hasSplit == false)
@@ -140,6 +232,7 @@ struct AppStorePaneTests {
         #expect(session.initialSplitCwd == nil)
         #expect(session.splitRatio == nil) // teardown clears geometry too, so a fresh re-split opens even
         #expect(session.splitAxis == .leftRight)
+        #expect(session.splitPaneIdentity == nil)
         #expect(split.teardownCount == 1)
     }
 
@@ -180,6 +273,9 @@ struct AppStorePaneTests {
         session.splitForegroundCommand = ["ssh", "host"]
         session.splitRatio = 0.3
         session.initialCommand = "ssh host" // a --command primary whose command has now exited
+        let primaryIdentity = session.paneIdentity
+        let splitIdentity = UUID()
+        session.splitPaneIdentity = splitIdentity
         store.closePrimaryPane(session.id)
         #expect(store.session(withID: session.id) != nil)
         #expect(primary.teardownCount == 1)
@@ -198,8 +294,31 @@ struct AppStorePaneTests {
         #expect(session.splitCwd == nil)
         #expect(session.splitTitle == nil)
         #expect(session.splitForegroundCommand == nil)
+        #expect(session.paneIdentity == splitIdentity)
+        #expect(session.paneIdentity != primaryIdentity)
+        #expect(session.splitPaneIdentity == nil)
         // the `?? splitSurface` fallback is for a shown split pre-collapse, not for a promoted survivor.
         #expect(session.addressableSurface === split)
+    }
+
+    @Test func closePrimaryPanePromotesSplitCreationIdentity() {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        session.surface = SpySurface()
+        session.splitSurface = SpySurface()
+        session.isSplit = true
+        session.hasSplit = true
+        session.initialCommand = "ssh primary-host"
+        session.splitInitialCommand = "ssh split-host"
+        session.splitCommandWait = true
+
+        store.closePrimaryPane(session.id)
+
+        #expect(session.initialCommand == "ssh split-host")
+        #expect(session.commandWait)
+        #expect(session.splitInitialCommand == nil)
+        #expect(!session.splitCommandWait)
     }
 
     // #416: `session.new` answers ok for a model insert, and libghostty refuses to build a surface while
@@ -220,6 +339,60 @@ struct AppStorePaneTests {
 
         parked.isRealized = true
         #expect(realized() == true)
+    }
+
+    @Test func controlTreeReportsPerPaneAndAggregateZmxBacking() {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        session.surface = SpySurface(backedByZmx: true)
+        session.hasSplit = true
+        session.isSplit = true
+        session.splitSurface = SpySurface(backedByZmx: false)
+
+        var node = store.controlTree().workspaces[0].sessions[0]
+        #expect(node.backedByZmx == false)
+        #expect(node.surfaces?.first(where: { $0.kind == "left" })?.backedByZmx == true)
+        #expect(node.surfaces?.first(where: { $0.kind == "right" })?.backedByZmx == false)
+        #expect(node.surfaces?.first(where: { $0.kind == "scratch" })?.backedByZmx == nil)
+
+        session.splitSurface = SpySurface(backedByZmx: true)
+        node = store.controlTree().workspaces[0].sessions[0]
+        #expect(node.backedByZmx == true)
+    }
+
+    @Test func controlTreeReportsEachPanesLeadOnceItsZmxHasReportedOne() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        session.surface = SpySurface(backedByZmx: true)
+        session.hasSplit = true
+        session.isSplit = true
+        session.splitPaneIdentity = UUID()
+        session.splitSurface = SpySurface(backedByZmx: true)
+        func lead(_ kind: String) -> ZmxLeadRole? {
+            store.controlTree().workspaces[0].sessions[0].surfaces?.first { $0.kind == kind }?.lead
+        }
+        #expect(lead("left") == nil)
+
+        let book = ZmxLeadBook.shared
+        book.begin(ZmxLeadAttachment(nonce: "l", claim: true), pane: session.paneIdentity)
+        book.begin(ZmxLeadAttachment(nonce: "r", claim: true), pane: try #require(session.splitPaneIdentity))
+        defer {
+            book.forget(pane: session.paneIdentity)
+            session.splitPaneIdentity.map(book.forget)
+        }
+        #expect(lead("left") == nil, "an attachment that has not reported has no role")
+
+        _ = book.apply(try #require(ZmxLeadNotice(title: "zmx-role;l:leader:1")), pane: session.paneIdentity)
+        _ = book.apply(try #require(ZmxLeadNotice(title: "zmx-role;r:follower:1")),
+                       pane: try #require(session.splitPaneIdentity))
+        #expect(lead("left") == .leader)
+        #expect(lead("right") == .follower)
+
+        let encoded = String(decoding: try JSONEncoder().encode(ControlSurfaceNode(
+            id: "s", kind: "left", active: true, visible: true, backedByZmx: true)), as: UTF8.self)
+        #expect(!encoded.contains("lead"), "omitted, not null, for a pane with no role")
     }
 
     @Test func addressableSurfaceIsTheMainPaneUntilThePrimaryExits() {
@@ -629,6 +802,27 @@ struct AppStorePaneTests {
         shell.commandWait = true
         node = try #require(store.controlTree().workspaces[0].sessions.first { $0.id == shell.id.uuidString })
         #expect(node.commandWait == nil)
+    }
+
+    @Test func controlTreeReportsSplitCommandWaitOnlyForHoldingCommand() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = store.addSession(toWorkspace: ws.id, cwd: "/a")!
+        store.toggleSplit(session.id)
+        session.splitInitialCommand = "make test"
+        session.splitCommandWait = true
+
+        var node = try #require(store.controlTree().workspaces[0].sessions.first)
+        #expect(node.splitCommandWait == true)
+
+        session.splitCommandWait = false
+        node = try #require(store.controlTree().workspaces[0].sessions.first)
+        #expect(node.splitCommandWait == nil)
+
+        session.splitInitialCommand = nil
+        session.splitCommandWait = true
+        node = try #require(store.controlTree().workspaces[0].sessions.first)
+        #expect(node.splitCommandWait == nil)
     }
 
     @Test func controlTreeReportsOverlaySizePercent() throws {
@@ -1082,6 +1276,45 @@ struct AppStorePaneTests {
                               size: HudPanelSize(widthPercent: 20, heightPercent: 9)) == false)
         #expect(session.overlayCommand == "htop")
         #expect(session.hudSpec == nil)
+    }
+
+    @Test func softClosingASessionTakesDownAPanelThatWasCountingItselfOut() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/a"))
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "deploying", hideAfter: 10),
+                      file: "/tmp/body", size: HudPanelSize(widthPercent: 20, heightPercent: 9))
+
+        #expect(store.softCloseSession(session.id))
+
+        #expect(!session.hudActive, "an expiry could not resolve it once the session leaves the tree")
+    }
+
+    @Test func softClosingASessionKeepsAPanelWithNoAutoHide() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/a"))
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "waiting"),
+                      file: "/tmp/body", size: HudPanelSize(widthPercent: 20, heightPercent: 9))
+
+        #expect(store.softCloseSession(session.id))
+
+        #expect(session.hudActive, "undo restores the session exactly as it was")
+    }
+
+    @Test func discardingAHudCancelsWhateverArmedItsAutoHide() throws {
+        let store = makeStore()
+        let ws = store.addWorkspace(name: "work")
+        let session = try #require(store.addSession(toWorkspace: ws.id, cwd: "/a"))
+        store.openHud(session.id, command: "hud.sh", spec: HudSpec(message: "deploying", hideAfter: 10),
+                      file: "/tmp/body", size: HudPanelSize(widthPercent: 20, heightPercent: 9))
+        var cancelled = 0
+        session.onHudDiscarded = { cancelled += 1 }
+
+        store.closeHud(session.id)
+
+        #expect(cancelled == 1)
+        #expect(session.onHudDiscarded == nil, "a second discard must not call a hook the first one spent")
     }
 
     @Test func overlaySlotGenerationTracksOpensOnly() {
@@ -1632,7 +1865,7 @@ struct AppStorePaneTests {
         store.closePrimaryPane(session.id) // primary exits → survivor promoted, hasSplit/splitSurface cleared
         store.setAgentIndicator(AgentIndicator(status: .blocked, statusPane: .right), forSession: session.id)
         #expect(session.agentIndicator.statusPane == .left)                      // coerced — no live split
-        #expect(session.agentIndicator.clearedBy(pane: .left, isInterrupt: false))  // the sole (left) pane clears it
+        #expect(session.agentIndicator.clearedBy(pane: .left, keystroke: .other, reset: .firstKey))  // the sole (left) pane clears it
         // and the tree agrees: split:false with statusPane "left", never the contradictory "right".
         let node = store.controlTree().workspaces[0].sessions.first
         #expect(node?.split == false)
@@ -1663,7 +1896,7 @@ struct AppStorePaneTests {
         #expect(session.agentIndicator.statusPane == .right)                  // kept — the split is coming up
         // once the deck realizes the surface, the block is exactly where the right pane can clear it.
         session.splitSurface = SpySurface()
-        #expect(session.agentIndicator.clearedBy(pane: .right, isInterrupt: false))
+        #expect(session.agentIndicator.clearedBy(pane: .right, keystroke: .other, reset: .firstKey))
         let node = store.controlTree().workspaces[0].sessions.first
         #expect(node?.split == true)
         #expect(node?.statusPane == "right")
@@ -1691,5 +1924,57 @@ struct AppStorePaneTests {
         store.setAgentIndicator(AgentIndicator(status: .blocked, statusPane: .left), forSession: session.id)
         #expect(store.closeScratch(session.id) == true)
         #expect(session.agentIndicator.status == .blocked)
+    }
+    // MARK: - launch pane drops
+
+    private func droppingStore() -> (AppStore, DropLog) {
+        let log = DropLog()
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("agterm-tests-\(UUID().uuidString)")
+        let store = AppStore(persistence: PersistenceStore(directory: dir), paneFinalizer: nil,
+                             launchPaneDrop: { log.identities += $0 })
+        store.workspaces = [Workspace(name: "workspace 1", sessions: [])]
+        return (store, log)
+    }
+
+    private final class DropLog {
+        var identities: [UUID] = []
+    }
+
+    @Test func hidingAShownSplitDropsOnlyTheSplitKey() throws {
+        let (store, log) = droppingStore()
+        let session = Session(initialCwd: "/tmp")
+        store.workspaces[0].sessions.append(session)
+        store.setSplitVisibility(session.id, shown: true)
+        let split = try #require(session.splitPaneIdentity)
+
+        store.setSplitVisibility(session.id, shown: false)
+
+        #expect(log.identities == [split])
+    }
+
+    @Test func hidingAHiddenSplitAndShowingOneDropNothing() {
+        let (store, log) = droppingStore()
+        let session = Session(initialCwd: "/tmp")
+        session.hasSplit = true
+        session.splitPaneIdentity = UUID()
+        store.workspaces[0].sessions.append(session)
+
+        store.setSplitVisibility(session.id, shown: false)
+        store.setSplitVisibility(session.id, shown: true)
+
+        #expect(log.identities.isEmpty)
+    }
+
+    @Test func closingASplitDropsItsKey() throws {
+        let (store, log) = droppingStore()
+        let session = Session(initialCwd: "/tmp")
+        store.workspaces[0].sessions.append(session)
+        store.setSplitVisibility(session.id, shown: true)
+        let split = try #require(session.splitPaneIdentity)
+        log.identities = []
+
+        store.closeSplit(session.id)
+
+        #expect(log.identities == [split])
     }
 }

@@ -21,6 +21,9 @@ final class ControlServer {
     let library: WindowLibrary
     let actions: AppActions
     let settingsModel: SettingsModel
+    let statusSoundPlayer: StatusSoundPlayer
+    let launchRestoreMode: RestoreMode
+    let zmxForegroundResolver: ZmxForegroundResolver?
     private let socketPath: String
 
     /// The target-resolution query layer: owns the `emptyStore`/`store` frontmost-fallback and wraps the
@@ -59,12 +62,40 @@ final class ControlServer {
     private let cacheLock = NSLock()
     nonisolated(unsafe) private var cachedWindowNodes: [ControlWindowNode] = []
 
+    /// Live HUD auto-hide timers, one per session. `ControlServer+Hud` owns the logic; the state sits here
+    /// because an extension cannot hold it. Main-actor only.
+    var hudAutoHide: [UUID: HudAutoHide] = [:]
+    /// hudGeometryPending holds the sessions whose HUD body rewrite is queued for this main-actor turn.
+    var hudGeometryPending: Set<UUID> = []
+    /// The clock HUD expiry deadlines are stamped from.
+    var hudClock: () -> Date = Date.init
+
+    /// Presentation streams to attached viewers. `ControlServer+Presentation` owns the logic; the state sits
+    /// here because an extension cannot hold it. Main-actor only.
+    let presentationHub = PresentationHub(staleTimeout: 30)
+    var presentationStreams: [PresentationStream] = []
+    /// Remote overlay jobs this Mac handed to presenters.
+    let overlayJobs = OverlayJobs()
+    var overlayJobStreams: [String: OverlayJobStream] = [:]
+    /// Jobs cancelled between their claim and the adoption of the helper's connection.
+    var pendingJobCancels: Set<String> = []
+    var presentationHeartbeat: Task<Void, Never>?
+    /// How long an adopted stream may stay silent before its first hello.
+    var presentationHelloDeadline: TimeInterval = 10
+
+    /// This Mac as a VIEWER: one client per attached session. `ControlServer+RemotePresentation` owns the
+    /// logic. The transport is injectable so a hosted test needs no ssh.
+    var remoteClients: [UUID: RemotePresentationClient] = [:]
+    var remoteTransport: RemotePresentationTransport = RemotePresentationProcess()
+    var remoteTick: Task<Void, Never>?
+
     nonisolated private func cachedWindows() -> [ControlWindowNode] {
         cacheLock.lock(); defer { cacheLock.unlock() }
         return cachedWindowNodes
     }
 
     @MainActor func refreshWindowCache() {
+        attachPresentationHub()
         let nodes = buildWindowList()
         cacheLock.lock(); cachedWindowNodes = nodes; cacheLock.unlock()
     }
@@ -87,21 +118,6 @@ final class ControlServer {
             return ControlResponse(ok: false, error: "window not open — window.select it first")
         default:
             return nil
-        }
-    }
-
-    /// The sentence inside a `DecodingError`, read off its `Context` rather than off the error: the error's
-    /// own `debugDescription` is macOS 26.4+, so at this app's 14.0 deployment target `String(describing:)`
-    /// falls back to a reflection dump that buries the same sentence inside `DecodingError.Context(...)`.
-    /// Every case carries a context, and the `@unknown default` keeps a future case readable rather than
-    /// silent.
-    nonisolated private static func decodeDetail(_ error: DecodingError) -> String {
-        switch error {
-        case .dataCorrupted(let context), .keyNotFound(_, let context),
-                .typeMismatch(_, let context), .valueNotFound(_, let context):
-            return context.debugDescription
-        @unknown default:
-            return String(describing: error)
         }
     }
 
@@ -129,15 +145,64 @@ final class ControlServer {
     /// Which agterm this is, injected rather than read from `Bundle.main` here: the identity is the app's to
     /// know, and a hosted test would otherwise see its own host bundle.
     let identity: AppIdentity
+    /// Talks to the daemons behind the zmx commands. Present in every real launch, live mode or not —
+    /// `list` and `prune` must still work after a launch in `none` or `rerun`, which is exactly when
+    /// detached daemons are left over. Nil only in hosted tests, where the commands answer that the
+    /// backend is unavailable rather than pretending an empty listing.
+    let zmxClient: ZmxClient?
+    let liveAttributionProbe: LiveAttributionProbe
+    /// zmxOutdatedBefore is the launch's `ZmxBuildRecord` cutoff; nil turns the outdated reset reason off.
+    let zmxOutdatedBefore: Date?
+
+    /// Runs the ssh invocations behind the remote commands. Injectable so hosted tests drive them against
+    /// a fake instead of a second Mac.
+    let remoteRunner: any RemoteCommandRunner
+
+    /// How long a remote projection read may take before it is abandoned. `ConnectTimeout` bounds only the
+    /// handshake, so this is what covers a remote agterm that never answers.
+    static let remoteTreeDeadline: TimeInterval = 10
+
+    /// Writes one reply frame and reports whether all of it went out. Injectable so a hosted test can hold
+    /// or fail the `zmx.reset` reply and watch what the quit does.
+    typealias ResponseWriter = @Sendable (Int32, ControlResponse) -> Bool
+    nonisolated let responseWriter: ResponseWriter
+
+    /// The Live sessions reset's confirm path; nil refuses `zmx.reset` as unsupported.
+    var liveReset: LiveResetCoordinator?
+    /// The scheduler's rows for `hooks.list`, wired by `agtermApp` once the controller exists.
+    var hookStatus: () -> [ControlHookEntry] = { [] }
+    /// The last launch's reset outcome for the read-back; injectable so a hosted test stages one.
+    var liveResetOutcome: () -> LiveReset.Outcome? = { GhosttyApp.shared.liveResetOutcome }
 
     init(library: WindowLibrary, actions: AppActions, settingsModel: SettingsModel, identity: AppIdentity,
-         socketPath: String? = nil) {
+         launchRestoreMode: RestoreMode = GhosttyApp.shared.launchRestoreMode,
+         zmxForegroundResolver: ZmxForegroundResolver? = nil, zmxClient: ZmxClient? = nil,
+         zmxOutdatedBefore: Date? = nil,
+         liveAttributionProbe: LiveAttributionProbe = LiveAttributionProbe(),
+         remoteRunner: (any RemoteCommandRunner)? = nil,
+         statusSoundPlayer: StatusSoundPlayer = .shared,
+         socketPath: String? = nil,
+         responseWriter: @escaping ResponseWriter = ControlServer.writeResponse) {
+        self.responseWriter = responseWriter
+        self.remoteRunner = remoteRunner ?? RemoteCommandProcessRunner()
         self.library = library
         self.actions = actions
         self.settingsModel = settingsModel
+        self.statusSoundPlayer = statusSoundPlayer
+        self.launchRestoreMode = launchRestoreMode
+        self.zmxForegroundResolver = zmxForegroundResolver
+        self.zmxClient = zmxClient
+        self.zmxOutdatedBefore = zmxOutdatedBefore
+        self.liveAttributionProbe = liveAttributionProbe
         self.identity = identity
         self.resolver = ControlTargetResolver(library: library)
         self.socketPath = socketPath ?? ControlServer.defaultSocketPath()
+        AskRegistry.shared.resolveOwner = { [weak library] owner in
+            switch owner {
+            case .window(let id): PickRegistry.shared.controller(for: id)?.pendingAsk
+            case .session(let id, let window): library?.store(for: window)?.session(withID: id)?.askPending
+            }
+        }
         // ownership is decided HERE, not in `start()`. The launch window's surfaces are built during the
         // initial render pass and SNAPSHOT `AGTERM_SOCKET` into the pty environment (`GhosttySurfaceView.env`
         // is a `let` read at spawn), while `start()` runs from the scene's `.task` afterwards. Deciding late
@@ -175,6 +240,12 @@ final class ControlServer {
                                                queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshWindowCache() }
         }
+        // through `dispatch`, not the dispatcher, so a page request refreshes the window cache and reaches the
+        // commands only the app's own switch handles
+        HtmlOverlayRegistry.shared.dispatch = { [weak self] request in
+            await self?.dispatch(request) ?? ControlResponse(ok: false, error: "control is unavailable")
+        }
+        HtmlOverlayRegistry.shared.windowID = { [weak library] store in library?.windowID(for: store)?.uuidString }
     }
 
     /// The socket path the app and the CLI rendezvous on. `AGTERM_CONTROL_SOCKET` wins (tests need it —
@@ -246,6 +317,8 @@ final class ControlServer {
         // outside the guard: the lock is taken in `init`, so an instance that never bound (path too long,
         // or a bind that failed) still holds one and would otherwise keep it for the whole process.
         defer { releaseOwnership() }
+        shutdownPresentationStreams()
+        stopRemotePresentations()
         guard listenFD >= 0 else { return }
         close(listenFD)
         listenFD = -1
@@ -263,7 +336,7 @@ final class ControlServer {
     /// same moment, and the kernel releases it when a force-quit kills the holder — which is the case the
     /// `unlink` in `start()` exists for.
     private func acquireOwnership() -> Bool {
-        let lockPath = socketPath + ".lock"
+        let lockPath = ControlResolve.ownershipLockPath(forSocket: socketPath)
         let fd = open(lockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
         guard fd >= 0 else {
             log("control lock open(\(lockPath)) failed: \(String(cString: strerror(errno)))")
@@ -328,7 +401,9 @@ final class ControlServer {
     /// Read one newline-delimited request from `conn`, decode it, dispatch it on `server` (main actor), write
     /// the response back, close. A decode failure replies with a structured error. Runs on the background queue.
     nonisolated private static func handleConnection(_ conn: Int32, server: ControlServer) {
-        defer { close(conn) }
+        // the remote commands hand the descriptor to a thread of their own, which then owns closing it
+        var handedOff = false
+        defer { if !handedOff { close(conn) } }
         // a write to a client that already hung up would raise the default-fatal SIGPIPE and take the whole
         // app down mid-request; SO_NOSIGPIPE turns it into a normal EPIPE write error.
         var noSigPipe: Int32 = 1
@@ -341,7 +416,7 @@ final class ControlServer {
         setsockopt(conn, SOL_SOCKET, SO_SNDTIMEO, &writeTimeout, socklen_t(MemoryLayout<timeval>.size))
 
         guard let line = readLine(conn) else {
-            writeResponse(conn, ControlResponse(ok: false, error: "request too large or read failed"))
+            _ = server.responseWriter(conn, ControlResponse(ok: false, error: "request too large or read failed"))
             return
         }
 
@@ -352,22 +427,76 @@ final class ControlServer {
             // the decode CONTEXT over `localizedDescription`, which is the generic "data couldn't be read":
             // the context names the rejected `cmd`, telling a caller its agterm is older than its agtermctl,
             // and only for a command added after THIS code shipped, since an older server returns the generic.
-            let detail = (error as? DecodingError).map(Self.decodeDetail) ?? error.localizedDescription
-            writeResponse(conn, ControlResponse(ok: false, error: "invalid request: \(detail)"))
+            _ = server.responseWriter(conn, ControlResponse(ok: false, error: ControlWire.invalidRequestMessage(error)))
             return
         }
 
         // answer read-only window queries from the cache without a main-actor hop: a window close briefly
         // stalls the main thread (surface teardown / re-render), wedging the accept loop against polls.
         if let cached = server.fastPathResponse(for: request) {
-            writeResponse(conn, cached)
+            _ = server.responseWriter(conn, cached)
+            return
+        }
+
+        // a presentation stream outlives its request: the reply below is the last ordinary one, and an ok
+        // hands the descriptor to a stream owner so this thread goes straight back to accepting.
+        if request.cmd == .zmxPresent {
+            let response = runBlocking { await server.dispatch(request) }
+            guard server.responseWriter(conn, response), response.ok,
+                  let session = response.result?.id.flatMap(UUID.init(uuidString:)) else { return }
+            handedOff = true
+            runBlocking { await server.adoptPresentationStream(descriptor: conn, session: session) }
+            return
+        }
+
+        // a claimed job's helper keeps its connection the same way, and a claim whose reply never reached
+        // the helper leaves nobody to run the job
+        if request.cmd == .sessionOverlayJobRun {
+            let response = runBlocking { await server.dispatch(request) }
+            let written = server.responseWriter(conn, response)
+            guard response.ok, let job = response.result?.id else { return }
+            guard written else {
+                runBlocking { await server.overlayJobs.helperGone(job) }
+                return
+            }
+            handedOff = true
+            runBlocking { await server.adoptOverlayJobStream(descriptor: conn, job: job) }
+            return
+        }
+
+        // `zmx tree <this machine>` would otherwise deadlock against itself: the far side's own agtermctl
+        // waits in this server's backlog while this connection holds the only accept thread.
+        if Self.waitsOnNetwork(request.cmd) {
+            handedOff = true
+            let worker = Thread {
+                defer { close(conn) }
+                _ = server.responseWriter(conn, runBlocking { await server.dispatch(request) })
+            }
+            worker.name = "com.umputun.agterm.control.remote"
+            worker.start()
             return
         }
 
         // hop to the main actor, blocking this background thread. dispatch refreshes the window cache in that
         // same execution, so the fast path sees this command's mutations without a second, stallable hop.
         let response = runBlocking { await server.dispatch(request) }
-        writeResponse(conn, response)
+        let written = server.responseWriter(conn, response)
+        // the quit after a confirmed reset waits for THIS reply to be on the wire, decided from this request
+        // and this response so a remote worker finishing another reply in parallel can never trigger it
+        guard request.cmd == .zmxReset, response.ok else { return }
+        guard written else {
+            logger.error("zmx.reset reply was not written; the reset stays pending for a later quit")
+            return
+        }
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { server.liveReset?.terminateIfPending() }
+        }
+    }
+
+    /// Commands whose dispatch awaits an ssh round trip. `zmx.attach` re-resolves the remote first, so it
+    /// carries the same wait; local `zmx.list` blocks too, but bounded, and stays inline to keep cache order.
+    nonisolated private static func waitsOnNetwork(_ cmd: Command) -> Bool {
+        cmd == .zmxTree || cmd == .zmxAttach
     }
 
     /// Read bytes from `conn` up to (and excluding) the first newline. Returns nil on EOF-before-newline, a
@@ -391,23 +520,24 @@ final class ControlServer {
     }
 
     /// Encode `response` and write it back as a single newline-terminated line.
-    nonisolated private static func writeResponse(_ conn: Int32, _ response: ControlResponse) {
-        guard var data = try? JSONEncoder().encode(response) else { return }
+    nonisolated static func writeResponse(_ conn: Int32, _ response: ControlResponse) -> Bool {
+        guard var data = try? JSONEncoder().encode(response) else { return false }
         data.append(UInt8(ascii: "\n"))
-        data.withUnsafeBytes { raw in
+        return data.withUnsafeBytes { raw in
             var offset = 0
             let base = raw.bindMemory(to: UInt8.self).baseAddress!
             let deadline = DispatchTime.now() + .seconds(writeDeadlineSeconds)
             while offset < data.count {
-                if DispatchTime.now() > deadline { return }
+                if DispatchTime.now() > deadline { return false }
                 let n = write(conn, base + offset, data.count - offset)
                 if n < 0 {
                     if errno == EINTR { continue } // retry an interrupted write
-                    return
+                    return false
                 }
-                if n == 0 { return }
+                if n == 0 { return false }
                 offset += n
             }
+            return true
         }
     }
 
@@ -446,24 +576,31 @@ final class ControlServer {
                 .workspaceNew, .workspaceSelect, .workspaceGo, .workspaceRename, .workspaceDelete, .workspaceMove,
                 .workspaceFocus,
                 .workspaceFilter, .workspaceCollapse, .workspaceExpand,
-                .sessionSplit, .sessionSplitClose, .sessionScratch, .sessionFocus, .sessionResize, .surfaceZoom,
+                .sessionSplit, .sessionSplitClose, .sessionSwap, .sessionLead, .sessionScratch, .sessionFocus,
+                .sessionResize, .surfaceZoom,
                 .surfaceCursor,
-                .sessionStatus, .sessionFlag, .sessionSeen, .sessionRestore, .notify,
-                .fontInc, .fontDec, .fontReset, .keymapReload, .keymapList, .configReload, .themeSet, .themeList,
-                .sidebar, .sidebarMode, .sidebarExpand, .sidebarCollapse, .sessionType, .sessionCopy,
+                .sessionStatus, .sessionFlag, .sessionContext, .sessionSeen, .sessionRestore, .notify,
+                .fontInc, .fontDec, .fontReset, .keymapReload, .keymapList, .hooksReload, .hooksList, .configReload,
+                .themeSet, .themeList,
+                .sidebar, .sidebarMode, .sidebarFlaggedLayout, .sidebarExpand, .sidebarCollapse, .sidebarWidth,
+                .sessionType, .sessionCopy,
                 .sessionPaste, .sessionSelectAll,
                 .sessionSearch, .sessionOverlayOpen, .sessionOverlayClose, .sessionOverlayResize,
-                .sessionOverlayResult, .sessionOverlayCopy, .sessionOverlayText,
+                .sessionOverlayReload, .sessionOverlayNavigate,
+                .sessionOverlayResult, .sessionOverlaySubmit, .sessionOverlayCopy, .sessionOverlayText,
                 .sessionBackground, .sessionText, .quick, .quickType, .quickText,
-                .windowNew, .windowList, .windowSelect,
+                .windowNew, .windowList, .windowSelect, .windowGo,
                 .windowClose, .windowRename, .windowDelete, .windowResize, .windowMove, .windowZoom,
                 .windowFullscreen, .windowMinimize,
-                .restoreClear, .restoreCapture, .dashboard, .version:
+                .restoreClear, .restoreCapture, .restoreMode, .zmxList, .zmxPrune, .zmxKill, .zmxReset, .zmxTree,
+                .zmxAttach, .zmxPresent, .sessionOverlayJobRun, .dashboard, .version:
             return ControlResponse(ok: false, error: "control dispatcher did not handle \(request.cmd.rawValue)")
         case .debugAppearance:
             return setDebugAppearance(args: request.args)
         case .pickOpen, .pickResult, .pickCancel:
             preconditionFailure("pick command returned nil from ControlDispatcher")
+        case .askOpen, .askResult, .askCancel:
+            preconditionFailure("ask command returned nil from ControlDispatcher")
         case .sessionHudOpen, .sessionHudUpdate, .sessionHudClose:
             preconditionFailure("hud command returned nil from ControlDispatcher")
         }
@@ -518,6 +655,28 @@ final class ControlServer {
         return ControlResponse(ok: true)
     }
 
+    /// The restore-mode policy: settings, this launch's request, and what it got.
+    func readRestoreMode() -> ControlResponse {
+        ControlResponse(ok: true, result: ControlResult(restore: restoreStatus()))
+    }
+
+    /// Persist the mode for the NEXT launch; a pane is wrapped or not at creation, so this process keeps
+    /// the mode it started with.
+    func setRestoreMode(_ mode: RestoreMode) -> ControlResponse {
+        guard settingsModel.setRestoreMode(mode) else {
+            return ControlResponse(ok: false, error: "could not save the restore mode; settings keep "
+                + settingsModel.settings.effectiveRestoreMode.rawValue)
+        }
+        return ControlResponse(ok: true, result: ControlResult(restore: restoreStatus()))
+    }
+
+    func restoreStatus() -> ControlRestoreStatus {
+        let decision = GhosttyApp.shared.restoreLaunchDecision
+        return ControlRestoreStatus(configured: settingsModel.settings.effectiveRestoreMode,
+                                    requestedAtLaunch: decision.requested, active: decision.active,
+                                    unavailableReason: decision.liveUnavailableReason)
+    }
+
     /// Capture every open pane's live foreground command NOW, filling the same slots the quit-time capture
     /// fills, then persist them. The point is the exit that never runs `applicationWillTerminate`: a crash, a
     /// SIGKILL, a hard reset, or a restart that outruns the app's termination window. Run this from a
@@ -526,15 +685,17 @@ final class ControlServer {
     /// App-global like `clearRestoreCommands`, its inverse over the same slots: no `--window` selector, every
     /// open window. Consumption stays one-shot and launch-only, so nothing here changes replay.
     ///
-    /// Gated on the same setting as the two exit-time captures, and REFUSES rather than answering ok the way
-    /// `session.restore` does. Contract and reasoning in `.claude/rules/settings.md`.
+    /// Available only when rerun is configured for the next launch. It refuses in the other two modes,
+    /// unlike `session.restore`, which saves future rerun policy with a note.
     func captureRestoreCommands() -> ControlResponse {
-        guard settingsModel.settings.restoreRunningCommand == true else {
-            return ControlResponse(ok: false,
-                                   error: "\"Restore running commands on restart\" is off, nothing was captured")
+        let configuredMode = settingsModel.settings.effectiveRestoreMode
+        guard configuredMode == .rerun else {
+            return ControlResponse(ok: false, error: "restore.capture requires rerun mode; configured restore mode is "
+                + configuredMode.rawValue)
         }
         let sessions = library.allOpenSessions()
-        let captured = AppDelegate.captureForegroundCommands(sessions: sessions)
+        let captured = AppDelegate.captureForegroundCommands(
+            sessions: sessions, zmxResolver: zmxForegroundResolver)
         // this command's whole claim is that the argv reached disk, so the ack waits on the write and not on
         // the assignment: `saveAllOpen` swallows the result, `saveAllOpenChecked` reports it.
         guard library.saveAllOpenChecked() else {
@@ -574,8 +735,8 @@ final class ControlServer {
                 controller.close()
                 return ControlResponse(ok: true)
             }
-            if PickRegistry.shared.controller(for: windowID)?.pending != nil {
-                return ControlResponse(ok: false, error: "pick pending")
+            if let error = PickRegistry.shared.controller(for: windowID)?.pendingModalError {
+                return ControlResponse(ok: false, error: error)
             }
             var resolvedTargets: [ResolvedDashboardTarget] = []
             var unresolved: [String] = []
@@ -640,6 +801,17 @@ final class ControlServer {
     /// selected session's owner, since an empty or foreground-created workspace becomes current on its own).
     func buildTree(in store: AppStore) -> ControlTree {
         let shellBasename = ProcessInfo.processInfo.environment["SHELL"].map(CommandRestore.basename)
+        let sessions = store.workspaces.flatMap(\.sessions)
+        var leaders: [String: pid_t]?
+        if ZmxForegroundRefreshPolicy.hasWrappedPane(in: sessions.filter { $0.remoteHost == nil }) {
+            if let zmxClient {
+                leaders = zmxClient.sessionLeaderPIDs()
+                zmxForegroundResolver?.acceptLeaderSnapshot(leaders)
+            } else {
+                zmxForegroundResolver?.refreshIfNeeded()
+            }
+        }
+        let attributions = liveAttributions(in: sessions, leaders: leaders)
         // the projected window owns its quick terminal; find its id by store identity to read the live
         // QuickTerminalController.isVisible (a nil controller — never opened, or tearing down — reads false).
         let windowID = library.windowID(for: store)
@@ -647,16 +819,19 @@ final class ControlServer {
         // dashboard read-backs: the keyboard-driven dashboard bypasses the command path, so a cache goes stale.
         let dashboard = DashboardControllerRegistry.shared.controller(for: windowID)
         return store.controlTree(
-            foreground: { session in
+            paneForeground: { session in
                 (session.surface as? GhosttySurfaceView).flatMap {
-                    ForegroundProcess.running(for: $0, shellBasename: shellBasename)
+                    ForegroundProcess.running(for: $0, shellBasename: shellBasename,
+                                              zmxResolver: zmxForegroundResolver)
                 }
             },
-            splitForeground: { session in
+            splitPaneForeground: { session in
                 (session.splitSurface as? GhosttySurfaceView).flatMap {
-                    ForegroundProcess.running(for: $0, shellBasename: shellBasename)
+                    ForegroundProcess.running(for: $0, shellBasename: shellBasename,
+                                              zmxResolver: zmxForegroundResolver)
                 }
             },
+            liveAttribution: { attributions[$0] },
             fontSize: { ($0.addressableSurface as? GhosttySurfaceView)?.currentFontSize() },
             splitFontSize: { ($0.splitSurface as? GhosttySurfaceView)?.currentFontSize() },
             scratchFontSize: { ($0.scratchSurface as? GhosttySurfaceView)?.currentFontSize() },
@@ -670,6 +845,7 @@ final class ControlServer {
             // resolved through the projected window's registry entry on every tree build, and tree-only:
             // window.list is cache-backed, so mirroring a GUI-resolved pick there would go stale.
             pickPending: { windowID.flatMap { PickRegistry.shared.controller(for: $0)?.pending?.id } },
+            askPending: { windowID.flatMap { PickRegistry.shared.controller(for: $0)?.pendingAsk?.id } }, // GUI asks only
             dashboardMembers: {
                 guard let dashboard, dashboard.isOpen else { return nil }
                 return dashboard.members.map(\.controlRef)
@@ -690,7 +866,11 @@ final class ControlServer {
                 case .untouched: return "untouched"
                 }
             },
-            app: identity
+            app: identity,
+            liveReset: liveResetReadback(),
+            // the mirror the sidebars render from, so the read-back names what is on screen.
+            flaggedLayout: GhosttyApp.shared.flaggedViewLayout,
+            htmlZoom: HtmlOverlayRegistry.shared.zoom
         )
     }
 

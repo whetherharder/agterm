@@ -71,7 +71,7 @@ public final class AppStore {
     /// owns visibility, so toolbar, View menu, palette and the `sidebar` command all flip this one flag.
     public var sidebarVisible = true
 
-    /// Which view this window's sidebar renders: the tree or the flat flagged working set. Per-window state
+    /// Which view this window's sidebar renders: the tree or the flagged working set. Per-window state
     /// in `Snapshot`, flipped via `setSidebarMode(_:)` (bottom bar, View menu, palette, `sidebar.mode`).
     public var sidebarMode: SidebarMode = .tree
 
@@ -94,10 +94,10 @@ public final class AppStore {
     /// `BuiltinAction.toggleWorkspaceFilter`, and `workspace.filter`.
     public internal(set) var focusEnabled = false
 
-    /// This window's sidebar width in points, persisted in `Snapshot`; drag-driven, clamped to the bounds below.
+    /// Sidebar width in points, persisted per window; drag and `sidebar.width` write it.
     public var sidebarWidth: Double = AppStore.sidebarWidthDefault
 
-    /// Default + drag/restore bounds, shared by the divider drag and the `restore()` clamp so they can't drift.
+    /// Bounds shared by drag, `sidebar.width`, and `restore()` through `clampSidebarWidth`.
     public static let sidebarWidthDefault: Double = 220
     public static let sidebarWidthMin: Double = 160
     public static let sidebarWidthMax: Double = 560
@@ -109,11 +109,6 @@ public final class AppStore {
     /// The even split a never-moved divider renders at; the base for a relative
     /// `session.resize` while `Session.splitRatio` is nil.
     public static let splitRatioDefault: Double = 0.5
-
-    /// Clamp a primary-pane split fraction to `splitRatioMin...splitRatioMax`.
-    public static func clampSplitRatio(_ ratio: Double) -> Double {
-        min(splitRatioMax, max(splitRatioMin, ratio))
-    }
 
     /// Most-recently-selected session ids, front = current; drives the Ctrl-Tab switcher (`items[1]` is the
     /// previous). `@ObservationIgnored`, read imperatively; persisted so the order survives a relaunch.
@@ -131,6 +126,19 @@ public final class AppStore {
     @ObservationIgnored let recentClosedStore: RecentClosedStore?
     @ObservationIgnored var recentClosedDidChange: (() -> Void)?
     @ObservationIgnored let controlEventSink: ((ControlEventDraft) -> Void)?
+    /// Where this store publishes a session's presentation state for attached viewers. One hub serves every
+    /// window, since a viewer subscribes by session id alone.
+    @ObservationIgnored public var presentationHub: PresentationHub?
+    /// The remote overlay jobs this Mac handed to presenters, shared with the server like the hub.
+    @ObservationIgnored public var overlayJobs: OverlayJobs?
+    /// Told when an attached session's row is shown or leaves, undo and restoration included.
+    @ObservationIgnored public var onRemoteRowVisibility: ((Session, Bool) -> Void)?
+    @ObservationIgnored let paneFinalizer: (([UUID]) -> Void)?
+
+    /// Told the pane identities of every session or split leaving the visible model, hard or soft, which
+    /// can happen before any view was built for them. The launch spawn pacer discards those keys, or an
+    /// expected key nobody can claim holds its queue at the head forever.
+    @ObservationIgnored let launchPaneDrop: (([UUID]) -> Void)?
     /// Coalesces the high-frequency selection/font saves: a click-storm or a font ramp writes once after the
     /// burst settles instead of hitting disk per event.
     @ObservationIgnored private let saveDebouncer = Debouncer()
@@ -173,13 +181,17 @@ public final class AppStore {
                 persistence: PersistenceStore = PersistenceStore(),
                 recentClosedStore: RecentClosedStore? = nil,
                 recentClosedDidChange: (() -> Void)? = nil,
-                controlEventSink: ((ControlEventDraft) -> Void)? = nil) {
+                controlEventSink: ((ControlEventDraft) -> Void)? = nil,
+                paneFinalizer: (([UUID]) -> Void)?,
+                launchPaneDrop: (([UUID]) -> Void)? = nil) {
         self.workspaces = workspaces
         self.selectedSessionID = selectedSessionID
         self.persistence = persistence
         self.recentClosedStore = recentClosedStore
         self.recentClosedDidChange = recentClosedDidChange
         self.controlEventSink = controlEventSink
+        self.paneFinalizer = paneFinalizer
+        self.launchPaneDrop = launchPaneDrop
     }
 
     /// The currently selected session, derived from `selectedSessionID`.
@@ -254,51 +266,72 @@ public final class AppStore {
 
     /// Projects this store's workspace/session model into the control-channel `tree` payload. Foreground
     /// command lookup is supplied by the host because live process inspection is platform-specific.
-    public func controlTree(foreground: (Session) -> [String]? = { _ in nil },
-                            splitForeground: (Session) -> [String]? = { _ in nil },
+    /// `paneForeground` takes no default on purpose: the argv-shaped compatibility overload defaults every
+    /// closure, so one here would leave a bare `controlTree()` ambiguous between the two.
+    public func controlTree(paneForeground: (Session) -> CommandRestore.PaneForeground?,
+                            splitPaneForeground: (Session) -> CommandRestore.PaneForeground? = { _ in nil },
+                            liveAttribution: (UUID) -> SessionHost.Attribution? = { _ in nil },
                             fontSize: (Session) -> Double? = { _ in nil },
                             splitFontSize: (Session) -> Double? = { _ in nil },
                             scratchFontSize: (Session) -> Double? = { _ in nil },
                             quickVisible: () -> Bool? = { nil },
                             zoomedSurface: () -> String? = { nil },
                             pickPending: () -> String? = { nil },
+                            askPending: () -> String? = { nil },
                             dashboardMembers: () -> [String]? = { nil },
                             dashboardHighlighted: () -> String? = { nil },
                             dashboardFontSize: () -> Double? = { nil },
-                            dashboardFontMode: () -> String? = { nil }, app: AppIdentity? = nil) -> ControlTree {
+                            dashboardFontMode: () -> String? = { nil }, app: AppIdentity? = nil,
+                            liveReset: ControlLiveResetReadback? = nil,
+                            flaggedLayout: FlaggedViewLayout? = nil, htmlZoom: Double? = nil) -> ControlTree {
         let activeID = selectedSessionID
         // `currentWorkspaceID`, not the selected session's owner: an EMPTY destination selects nothing, so
         // deriving this from the selection alone made `tree` name the workspace `workspace.go` just left.
         let activeWorkspaceID = currentWorkspaceID
         let nodes = workspaces.map { workspace in
             let sessions = workspace.sessions.map { session in
+                // each closure inspects live processes, so call it once and split the answer in two.
+                let mainPane = paneForeground(session)
+                let splitPane = splitPaneForeground(session)
+                let local = session.remoteHost == nil
+                let mainAttribution: SessionHost.Attribution? = local && session.surface?.backedByZmx == true
+                    ? liveAttribution(session.paneIdentity) ?? .unknown : nil
+                let splitAttribution: SessionHost.Attribution? = local && session.hasSplit && session.splitSurface?.backedByZmx == true
+                    ? session.splitPaneIdentity.flatMap(liveAttribution) ?? .unknown : nil
                 let idle = session.agentIndicator.status == .idle
                 let status = idle ? nil : session.agentIndicator.status.rawValue
                 let statusPane = idle ? nil : session.agentIndicator.statusPane?.rawValue
                 let surfaces = TerminalZoomSurface.allCases.compactMap { surface -> ControlSurfaceNode? in
                     guard surface.isAvailable(in: session) else { return nil }
                     let id = TerminalSurfaceID(sessionID: session.id, surface: surface).rawValue
-                    return ControlSurfaceNode(id: id, kind: surface.rawValue,
-                                              active: surface.isActive(in: session),
-                                              visible: surface.isVisible(in: session))
+                    return ControlSurfaceNode(id: id, kind: surface.rawValue, active: surface.isActive(in: session),
+                                              visible: surface.isVisible(in: session),
+                                              backedByZmx: session.zmxBacking(for: surface),
+                                              lead: ZmxLeadBook.shared.role(pane: session.paneIdentity(for: surface)))
                 }
                 return ControlSessionNode(id: session.id.uuidString, name: session.displayName,
                                           cwd: session.effectiveCwd, title: session.oscTitle,
                                           active: session.id == activeID,
-                                          split: session.isSplit,
-                                          hasSplit: session.hasSplit ? true : nil,
+                                          split: session.isSplit, hasSplit: session.hasSplit ? true : nil,
+                                          backedByZmx: session.allPanesBackedByZmx,
                                           splitAxis: session.hasSplit ? session.splitAxis.rawValue : nil,
                                           splitRatio: session.hasSplit ? session.splitRatio : nil,
                                           splitFocused: session.hasSplit ? session.splitFocused : nil,
-                                          overlay: session.programOverlayActive,
-                                          overlaySizePercent: session.programOverlayActive
+                                          overlay: session.coverOverlayActive,
+                                          overlaySizePercent: session.coverOverlayActive
                                               ? session.overlaySizePercent : nil,
-                                          paneOverlays: paneOverlays(session),
-                                          hud: hudNode(session),
+                                          paneOverlays: paneOverlays(session), hud: hudNode(session),
+                                          ask: session.askPending.map {
+                                              ControlSessionAsk(id: $0.id, pane: session.askTargetPane?.rawValue,
+                                                                remote: session.askPresentedRemotely ? true : nil,
+                                                                replica: session.askReplica ? true : nil)
+                                          },
                                           scratch: session.scratchActive, flagged: session.flagged,
                                           commandWait: (session.initialCommand != nil && session.commandWait) ? true : nil,
-                                          foreground: foreground(session),
-                                          splitForeground: splitForeground(session),
+                                          splitCommandWait: (session.splitInitialCommand != nil && session.splitCommandWait)
+                                              ? true : nil,
+                                          foreground: mainPane?.command, splitForeground: splitPane?.command,
+                                          foregroundShell: mainPane?.shellName, splitForegroundShell: splitPane?.shellName,
                                           // the PERSISTED overrides, not the transient pending payloads, so
                                           // a read after one fired still reports what stays pinned.
                                           restoreCommand: session.restoreCommand,
@@ -307,8 +340,9 @@ public final class AppStore {
                                           statusBlink: idle ? nil : (session.agentIndicator.blink ? true : nil),
                                           statusColor: idle ? nil : session.agentIndicator.color,
                                           statusShape: idle ? nil : session.agentIndicator.shape?.rawValue,
-                                          statusChangedAt: idle ? nil : session.statusChangedAt?.timeIntervalSince1970,
+                                          statusChangedAt: session.statusChangedAt?.timeIntervalSince1970,
                                           background: session.backgroundWatermark,
+                                          paneBackgrounds: session.paneBackgrounds.isEmpty ? nil : session.paneBackgrounds,
                                           unseen: session.unseenCount > 0 ? session.unseenCount : nil,
                                           fontSize: fontSize(session),
                                           splitFontSize: splitFontSize(session),
@@ -317,7 +351,13 @@ public final class AppStore {
                                           // host-free: `isRealized` is on `TerminalSurface`, so this needs
                                           // no app-side closure like the font sizes above. An empty slot is
                                           // false, not omitted — "no terminal" either way to a caller.
-                                          realized: session.surface?.isRealized ?? false)
+                                          realized: session.surface?.isRealized ?? false,
+                                          context: session.effectiveContext, remoteHost: session.remoteHost,
+                                          splitCwd: session.hasSplit ? session.cwd(for: .right) : nil,
+                                          liveAttribution: mainAttribution?.rawValue, splitLiveAttribution: splitAttribution?.rawValue,
+                                          presentation: presentationNode(of: session), presenters: presentersNode(of: session),
+                                          remoteOverlays: remoteOverlayNodes(of: session),
+                                          htmlOverlays: htmlOverlayNodes(session, zoom: htmlZoom))
             }
             return ControlWorkspaceNode(id: workspace.id.uuidString, name: workspace.name,
                                         active: workspace.id == activeWorkspaceID,
@@ -327,13 +367,14 @@ public final class AppStore {
         }
         return ControlTree(workspaces: nodes, idleMs: idleMs(), autoFollowMs: autoFollowMs,
                            sidebarVisible: sidebarVisible, sidebarMode: sidebarMode.rawValue,
+                           sidebarFlaggedLayout: flaggedLayout?.rawValue, sidebarWidth: sidebarWidth,
                            workspaceFilter: focusEnabled,
                            quickVisible: quickVisible(), zoomedSurface: zoomedSurface(),
                            dashboardMembers: dashboardMembers(),
                            dashboardHighlighted: dashboardHighlighted(),
                            dashboardFontSize: dashboardFontSize(),
                            dashboardFontMode: dashboardFontMode(),
-                           pickPending: pickPending(), app: app)
+                           pickPending: pickPending(), askPending: askPending(), app: app, liveReset: liveReset)
     }
 
     /// The tree's `paneOverlays`: the panes covered by their own overlay, omitted when neither is.
@@ -350,7 +391,9 @@ public final class AppStore {
                               spinner: spec.spinner?.rawValue ?? HudSpinner.noneName,
                               backgroundColor: spec.backgroundColor, textColor: spec.textColor,
                               sizePercent: session.overlaySizePercent,
-                              heightPercent: session.hudHeightPercent, position: spec.position.rawValue)
+                              heightPercent: session.hudHeightPercent, position: spec.position.rawValue,
+                              pane: session.hudTargetPane?.rawValue, hideAfter: spec.effectiveHideAfter,
+                              markdown: spec.markdown, fontSize: spec.fontSize)
     }
 
     /// Creates a workspace and appends it. With `revealNewWorkspace` (the default) and the filter ON, the new
@@ -400,12 +443,15 @@ public final class AppStore {
     /// workspace matches.
     @discardableResult
     public func addSession(toWorkspace workspaceID: UUID, cwd: String, command: String? = nil,
-                           name: String? = nil, wait: Bool = false, at index: Int? = nil, select: Bool = true) -> Session? {
+                           name: String? = nil, wait: Bool = false, at index: Int? = nil, select: Bool = true,
+                           remoteHost: String? = nil) -> Session? {
         guard let wsIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) else { return nil }
         // both reach a custom command's expansion — cwd through initialCwd, name through customName — so
         // both are sanitized here. See TerminalText.
+        // `remoteHost` arrives here rather than being assigned after, because this call saves.
         let session = Session(initialCwd: TerminalText.sanitized(cwd),
-                              customName: name.map(TerminalText.sanitized)?.trimmedOrNil)
+                              customName: name.map(TerminalText.sanitized)?.trimmedOrNil,
+                              remoteHost: remoteHost)
         session.initialCommand = command
         session.commandWait = wait
         if let index {
@@ -472,21 +518,25 @@ public final class AppStore {
 
     /// Removes a session, tears down its surface, and — if it was active — reselects the most-recently-active
     /// surviving session in scope (`closeReselectionTarget(after:)`), falling back to the positional neighbor.
-    public func closeSession(_ sessionID: UUID) {
+    public func closeSession(_ sessionID: UUID, alreadyFinalized: UUID? = nil) {
         guard let location = location(ofSession: sessionID) else { return }
         let wasActive = selectedSessionID == sessionID
         let workspace = workspaces[location.workspaceIndex]
-        let removed = workspaces[location.workspaceIndex].sessions.remove(at: location.sessionIndex)
+        let removed = workspace.sessions[location.sessionIndex]
+        releaseLeavingSession(removed)
+        workspaces[location.workspaceIndex].sessions.remove(at: location.sessionIndex)
         emitSessionClosed(removed, workspace: workspace.id)
+        dropLaunchPanes([removed])
         recordRecentClosedSession(removed, workspaceID: workspace.id, workspaceName: workspace.name,
                                   workspaceIndex: location.workspaceIndex, sessionIndex: location.sessionIndex)
+        finalizePaneIdentities([removed], alreadyFinalized: alreadyFinalized)
         removed.surface?.teardown()
         removed.splitSurface?.teardown()
-        removed.overlaySurface?.teardown()
+        removed.teardownOverlaySlot()
         removed.teardownPaneOverlays()
         removed.scratchSurface?.teardown()
         removed.discardHudBody() // a HUD whose surface never realized has no teardown to delete its body file
-        WatermarkStorage.removeRenderedText(sessionID: sessionID) // drop any rendered .text PNG; the session is gone
+        WatermarkStorage.removeAllRenderedText(sessionID: sessionID) // drop any rendered .text PNG; the session is gone
         sessionRecency.remove(sessionID)
         if wasActive {
             selectedSessionID = closeReselectionTarget(after: location)
@@ -513,16 +563,21 @@ public final class AppStore {
         // record the membership BEFORE `dropFocusMember` below prunes it, so Reopen Closed Item can re-mark it
         recordRecentClosedWorkspace(workspace, selectedSessionID: removingActive ? selectedSessionID : nil,
                                     focusMember: focusedWorkspaceIDs.contains(workspaceID))
-        for session in workspace.sessions { emitSessionClosed(session, workspace: workspace.id) }
+        for session in workspace.sessions {
+            releaseLeavingSession(session)
+            emitSessionClosed(session, workspace: workspace.id)
+        }
         if workspace.sessions.isEmpty { scheduleTreeChanged() }
+        finalizePaneIdentities(workspace.sessions)
+        dropLaunchPanes(workspace.sessions)
         for session in workspace.sessions {
             session.surface?.teardown()
             session.splitSurface?.teardown()
-            session.overlaySurface?.teardown()
+            session.teardownOverlaySlot()
             session.teardownPaneOverlays()
             session.scratchSurface?.teardown()
             session.discardHudBody() // a HUD whose surface never realized has no teardown to delete its body file
-            WatermarkStorage.removeRenderedText(sessionID: session.id) // drop any rendered .text PNG; the session is gone
+            WatermarkStorage.removeAllRenderedText(sessionID: session.id) // drop any rendered .text PNG; the session is gone
             sessionRecency.remove(session.id)
         }
         dropFocusMember(workspaceID) // a marked root is gone; the filter goes with the last member
@@ -664,8 +719,8 @@ public final class AppStore {
     /// Steps the CURRENT workspace one place through `visibleWorkspaces`, WRAPPING, via `selectWorkspace`, so
     /// a focus filter confines it as it does session nav. Collapse state is deliberately NOT a term: skipping
     /// a folded workspace would let the sidebar's fold silently rewrite where a keystroke lands. Nil with
-    /// nowhere to step — flagged mode renders no workspace rows, and a lone workspace would only reselect
-    /// itself. Backs `next_workspace`/`previous_workspace` and `workspace.go`.
+    /// nowhere to step — flagged mode (`canStepWorkspaces` owns why), and a lone workspace would only
+    /// reselect itself. Backs `next_workspace`/`previous_workspace` and `workspace.go`.
     @discardableResult
     public func navigateWorkspace(_ direction: WorkspaceNavigation) -> WorkspaceStep? {
         guard canStepWorkspaces else { return nil }
@@ -795,73 +850,7 @@ public final class AppStore {
         if changed { save() }
     }
 
-    /// Sets (or clears) a session's flag — the durable flagged working-set membership the flat sidebar view
-    /// projects — and persists. Clean no-op for an unknown id or a matching flag, so delta-computed callers
-    /// stay idempotent. Unflagging narrows in `.flagged` mode (dropping the row rendering the active session),
-    /// hence `reselectIfSelectionHidden`; in tree mode it only repairs a selection stranded by something else.
-    public func setFlag(_ on: Bool, forSession id: UUID) {
-        guard let session = session(withID: id), session.flagged != on else { return }
-        session.flagged = on
-        pruneSidebarSelection()
-        reselectIfSelectionHidden()
-        save()
-    }
-
-    /// Sets (or clears) multiple sessions' flags in one save. Unknown ids are ignored.
-    public func setFlag(_ on: Bool, forSessions ids: [UUID]) {
-        let targetIDs = Set(ids)
-        guard !targetIDs.isEmpty else { return }
-        var changed = false
-        for workspace in workspaces {
-            for session in workspace.sessions where targetIDs.contains(session.id) && session.flagged != on {
-                session.flagged = on
-                changed = true
-            }
-        }
-        if changed {
-            pruneSidebarSelection()
-            reselectIfSelectionHidden() // the batch can unflag the active session too
-            save()
-        }
-    }
-
-    /// Sets (or clears) a session's background watermark and persists it; clean no-op for an unknown id or an
-    /// unchanged spec, so a repeated `session.background` is idempotent. Returns whether the spec CHANGED, so
-    /// the app target can gate its (retained, teardown-only-freed) per-surface config apply on a real change
-    /// — without that a scripted set-loop keeps appending owned configs. The store owns only the spec; the
-    /// C-boundary apply lives app-side in `ControlServer`/`GhosttySurfaceView`.
-    @discardableResult
-    public func setBackgroundWatermark(_ watermark: BackgroundWatermark?, forSession id: UUID) -> Bool {
-        guard let session = session(withID: id), session.backgroundWatermark != watermark else { return false }
-        let previous = session.backgroundWatermark
-        session.backgroundWatermark = watermark
-        // a `.text` watermark owns a rendered `<id>.png`; switching away leaves it unreferenced. `clear` and
-        // teardown sweep the same file, so this is only the eager reclaim for text→image/nil.
-        if previous?.kind == .text, watermark?.kind != .text {
-            WatermarkStorage.removeRenderedText(sessionID: id)
-        }
-        save()
-        return true
-    }
-
-    /// Unflags every session in one `save()`; no write when nothing is flagged. Backs Clear Flagged and the
-    /// `session.flag clear` control mode. No `reselectIfSelectionHidden`, unlike the `setFlag` mutators:
-    /// clearing EVERY flag leaves the list empty, so there is nowhere to move — a partial clear would need it.
-    public func clearFlags() {
-        var changed = false
-        for workspace in workspaces {
-            for session in workspace.sessions where session.flagged {
-                session.flagged = false
-                changed = true
-            }
-        }
-        if changed {
-            pruneSidebarSelection()
-            save()
-        }
-    }
-
-    /// The flagged sessions across all workspaces in tree order — the projection the flat sidebar renders.
+    /// The flagged sessions across all workspaces in tree order — the projection the flagged view renders.
     public var flaggedSessions: [Session] {
         workspaces.flatMap(\.sessions).filter(\.flagged)
     }
@@ -895,8 +884,8 @@ public final class AppStore {
                                       isExpanded: !(workspaceSnapshot.collapsed ?? false)))
         }
         // clamp on restore (not just nil-default) so a corrupt or hand-edited snapshot can't drive an
-        // out-of-range frame width; the drag path clamps to the same bounds.
-        sidebarWidth = min(AppStore.sidebarWidthMax, max(AppStore.sidebarWidthMin, snapshot.sidebarWidth ?? AppStore.sidebarWidthDefault))
+        // out-of-range frame width; the drag and `sidebar.width` clamp to the same bounds.
+        sidebarWidth = AppStore.clampSidebarWidth(snapshot.sidebarWidth ?? AppStore.sidebarWidthDefault)
         sidebarVisible = snapshot.sidebarVisible ?? true
         sidebarMode = snapshot.sidebarMode ?? .tree
         restoreFocus(from: snapshot)

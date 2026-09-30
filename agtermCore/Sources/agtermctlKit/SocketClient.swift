@@ -14,6 +14,17 @@ struct SocketClientError: Error, CustomStringConvertible {
     init(_ description: String) { self.description = description }
 }
 
+/// A server response beside the bytes it arrived as. `--json` prints `raw` unchanged, so a field this
+/// build of the CLI does not model still reaches the caller; the human path reads `response`.
+struct SocketReply {
+    let response: ControlResponse
+    /// The response line without its trailing newline.
+    let raw: Data
+
+    /// The line `--json` prints.
+    var line: String { String(decoding: raw, as: UTF8.self) }
+}
+
 /// A blocking, one-request-per-connection client for the agterm control socket: connect to a unix domain
 /// socket, write the request line, read the single response line, decode it.
 struct SocketClient {
@@ -25,7 +36,7 @@ struct SocketClient {
     private static let maxLineBytes = 64 << 20
 
     /// Connect, send `request` as one newline-terminated JSON line, read the response line, decode it.
-    func send(_ request: ControlRequest) throws -> ControlResponse {
+    func send(_ request: ControlRequest) throws -> SocketReply {
         var data = try JSONEncoder().encode(request)
         // the server rejects a request line over the shared cap (newline excluded, matching this count)
         // and closes the connection; check before writing so the caller gets this error instead of a
@@ -46,14 +57,14 @@ struct SocketClient {
             throw SocketClientError("no response from \(path)")
         }
         do {
-            return try JSONDecoder().decode(ControlResponse.self, from: line)
+            return SocketReply(response: try JSONDecoder().decode(ControlResponse.self, from: line), raw: line)
         } catch {
             throw SocketClientError("could not decode response: \(error.localizedDescription)")
         }
     }
 
-    /// Open and connect a `AF_UNIX` stream socket to `path`.
-    private func connect() throws -> Int32 {
+    /// Open and connect a `AF_UNIX` stream socket to `path`. The caller owns the descriptor.
+    func connect() throws -> Int32 {
         var addr = sockaddr_un()
         let pathCapacity = MemoryLayout.size(ofValue: addr.sun_path)
         guard path.utf8.count < pathCapacity else {
@@ -91,11 +102,45 @@ struct SocketClient {
             }
         }
         guard result == 0 else {
-            let message = String(cString: strerror(errno))
+            // close() and the hint's own probe may overwrite errno.
+            let failure = errno
+            let message = String(cString: strerror(failure))
             close(fd)
-            throw SocketClientError("connect(\(path)) failed: \(message) — is agterm running?")
+            throw SocketClientError("connect(\(path)) failed: \(message) — \(Self.hint(forConnect: failure, path: path))")
         }
         return fd
+    }
+
+    /// The sentence after a failed `connect`. A refusal and a missing socket are the two the ownership
+    /// lock narrows, and only to an owner being there: `ControlServer.start` keeps the lock after a failed
+    /// bind, so a held lock never says how the socket came to be unreachable.
+    private static func hint(forConnect failure: Int32, path: String) -> String {
+        guard failure == ECONNREFUSED || failure == ENOENT else { return "is agterm running?" }
+        if ownershipLockHeld(socketPath: path) == true {
+            return "the socket owner is present but not accepting connections"
+        }
+        return "agterm may be stopped or unable to accept connections"
+    }
+
+    /// Whether a process holds the server's ownership lock on `<socketPath>.lock`, nil when that cannot be
+    /// answered. Darwin's `F_GETLK` observes a `flock` without competing for it; taking a shared lock to
+    /// test instead would fail a starting instance's own `LOCK_EX|LOCK_NB`.
+    private static func ownershipLockHeld(socketPath: String) -> Bool? {
+        #if canImport(Darwin)
+        let fd = open(ControlResolve.ownershipLockPath(forSocket: socketPath), O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var query = flock()
+        query.l_type = Int16(F_WRLCK)
+        query.l_whence = Int16(SEEK_SET)
+        query.l_start = 0
+        query.l_len = 0
+        let queried = withUnsafeMutablePointer(to: &query) { fcntl(fd, F_GETLK, $0) }
+        guard queried == 0 else { return nil }
+        return query.l_type != Int16(F_UNLCK)
+        #else
+        return nil
+        #endif
     }
 
     /// Write all of `data` to `fd`, looping over short writes.
@@ -130,17 +175,21 @@ struct SocketClient {
         }
     }
 
-    /// Print a response: the raw JSON line with `json: true`, otherwise a human-readable summary. An error
-    /// response (`ok == false`, non-`--json`) goes to stderr; everything else to stdout.
-    static func printResponse(_ response: ControlResponse, json: Bool, echoID: Bool = false) {
-        if !json, !response.ok {
-            FileHandle.standardError.write(Data((formatResponse(response, json: false) + "\n").utf8))
+    /// Print a reply: the server's line unchanged with `json: true`, otherwise a human-readable summary. An
+    /// error response (`ok == false`, non-`--json`) goes to stderr; everything else to stdout.
+    static func printResponse(_ reply: SocketReply, json: Bool, echoID: Bool = false) {
+        if json {
+            print(reply.line)
             return
         }
-        print(formatResponse(response, json: json, echoID: echoID))
+        if !reply.response.ok {
+            FileHandle.standardError.write(Data((formatResponse(reply.response) + "\n").utf8))
+            return
+        }
+        print(formatResponse(reply.response, echoID: echoID))
     }
 
-    /// Render the immediate `pick.open` response as the documented `{"id":"…"}` JSON object.
+    /// Render a pick or ask open response as the documented `{"id":"…"}` JSON object.
     static func formatPickID(_ id: String) throws -> String {
         String(decoding: try JSONEncoder().encode(ControlResult(id: id)), as: UTF8.self)
     }
@@ -148,6 +197,21 @@ struct SocketClient {
     /// Render the nested `pick.result` payload itself, rather than the enclosing control response.
     static func formatPickResult(_ result: ControlPickResult) throws -> String {
         String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+    }
+
+    /// formatAskResult emits the nested ask payload without the control response wrapper.
+    static func formatAskResult(_ result: ControlAskResult) throws -> String {
+        String(decoding: try JSONEncoder().encode(result), as: UTF8.self)
+    }
+
+    /// askExitCode distinguishes user dismissal from administrative cancellation.
+    static func askExitCode(for outcome: ControlAskOutcome) -> ExitCode {
+        switch outcome {
+        case .answered: .success
+        case .escaped: ExitCode(rawValue: 3)
+        case .pending: .failure
+        case .cancelled: ExitCode(rawValue: 2)
+        }
     }
 
     /// Map every picker state to a process status. `pending` is non-terminal in the blocking loop; if
@@ -160,23 +224,27 @@ struct SocketClient {
         }
     }
 
+    /// pageExitCode matches pick: 0 answered, 2 dismissed; a one-shot read of a pending page is a failure.
+    static func pageExitCode(for outcome: ControlHtmlPageOutcomeState) -> ExitCode {
+        switch outcome {
+        case .submitted: .success
+        case .pending: .failure
+        case .dismissed: ExitCode(rawValue: 2)
+        }
+    }
+
     /// Human choices may take minutes, so poll quickly only for the first second (ten 100 ms waits),
     /// then back off to 500 ms rather than hammering the server's serial accept loop indefinitely.
     static func pickPollDelay(afterPendingPoll poll: Int) -> TimeInterval {
         poll <= 10 ? 0.1 : 0.5
     }
 
-    /// Render a response to a single string (no trailing newline): the raw JSON line with `json: true`,
-    /// otherwise a human-readable summary — an `error:` line, the tree listing, the selected text, the
-    /// affected id (only when `echoID`, i.e. for the create commands), or a bare `ok`. Pure so it can be
-    /// unit-tested directly; `printResponse` routes it to stdout/stderr.
-    static func formatResponse(_ response: ControlResponse, json: Bool, echoID: Bool = false) -> String {
-        if json {
-            if let data = try? JSONEncoder().encode(response), let line = String(data: data, encoding: .utf8) {
-                return line
-            }
-            return ""
-        }
+    /// Render a response as its human-readable summary (no trailing newline): an `error:` line, the tree
+    /// listing, the selected text, the affected id (only when `echoID`, i.e. for the create commands), or
+    /// a bare `ok`. Never JSON: `--json` prints the server's own line through `printResponse`, and a
+    /// re-encoding here would drop every field this build does not model. Pure so it can be unit-tested
+    /// directly; `printResponse` routes it to stdout/stderr.
+    static func formatResponse(_ response: ControlResponse, echoID: Bool = false) -> String {
         if !response.ok {
             return "error: " + (response.error ?? "unknown error")
         }
@@ -192,6 +260,18 @@ struct SocketClient {
         }
         if let keymap = response.result?.keymap {
             return formatKeymap(keymap)
+        }
+        if let hooks = response.result?.hooks {
+            return formatHooks(hooks)
+        }
+        if let remote = response.result?.remote {
+            return formatRemoteTree(remote)
+        }
+        if let zmx = response.result?.zmx {
+            return formatZmx(zmx)
+        }
+        if let restore = response.result?.restore {
+            return formatRestoreStatus(restore)
         }
         if let app = response.result?.app {
             guard let commit = app.commit, !commit.isEmpty else { return app.version }
@@ -215,15 +295,92 @@ struct SocketClient {
             // payload ever gains a row: a second field belongs under --json, not in a format callers parse.
             return "\(cursor.column)"
         }
+        if let width = response.result?.width, let height = response.result?.height {
+            return "\(width) \(height)"
+        }
         if let ratio = response.result?.ratio {
             // session.resize echoes the applied (clamped) primary-pane fraction, scriptable as a bare number.
             return String(format: "%.3f", ratio)
+        }
+        if let sidebarWidth = response.result?.sidebarWidth {
+            // sidebar.width echoes the STORED (clamped) points, preserved without fixed-decimal rounding:
+            // a caller comparing its request against the echo reads a difference as a clamp, and rounding an
+            // honored 271.34 to 271.3 would report one that never happened. This is the Double's own
+            // description, so 300 comes back "300.0" - equivalent spellings differ and the comparison the
+            // docs ask for is NUMERIC, never string equality.
+            return String(sidebarWidth)
         }
         if echoID, let id = response.result?.id {
             return id
         }
         return "ok"
     }
+
+    /// The restore policy as separate lines: "what the next launch will do" and "what this one did" are
+    /// different questions, and collapsing them is what leaves a caller wondering why nothing happened.
+    static func formatRestoreStatus(_ status: ControlRestoreStatus) -> String {
+        var lines = ["configured: \(status.configured) (next launch)",
+                     "this launch: requested \(status.requestedAtLaunch), active \(status.active)"]
+        if status.restartRequired { lines.append("restart agterm to apply the configured mode") }
+        if let reason = status.unavailableReason { lines.append("live unavailable: \(reason)") }
+        return lines.joined(separator: "\n")
+    }
+
+    /// A remote host's attachable sessions, one per line, carrying the session id `zmx attach` takes. An
+    /// empty answer says so rather than printing nothing, which a caller cannot tell from a failed read.
+    static func formatRemoteTree(_ tree: ControlRemoteTree) -> String {
+        let place = tree.host.map { " on \($0)" } ?? ""
+        guard !tree.sessions.isEmpty else { return "no attachable sessions\(place)" }
+        return tree.sessions.map { session in
+            let split = session.panes.count > 1 ? " (split\(session.splitAxis.map { " \($0)" } ?? ""))" : ""
+            // what the row is for, then where it is: the running command answers "attach to which one"
+            // more often than the path does, and the context line is the far side's own answer to it
+            let running = session.panes.compactMap { $0.foreground?.first.map { CommandRestore.basename($0) } }
+            let detail = [session.context, running.isEmpty ? nil : running.joined(separator: " | ")]
+                .compactMap { $0 }.joined(separator: "  ")
+            let tail = detail.isEmpty ? "" : "  \(detail)"
+            let at = "\(session.windowName)/\(session.workspaceName)/\(session.name)"
+            return "  \(at)\(split)  [\(session.id)]  \(session.cwd)\(tail)"
+        }.joined(separator: "\n")
+    }
+
+    /// The daemon inventory under the restore header. Owner window state is its own column rather than
+    /// left to the client count: a closed window's panes sit at zero clients normally, and a reader given
+    /// only the count would read that as a leak.
+    static func formatZmx(_ inventory: ControlZmxInventory) -> String {
+        var lines = [formatRestoreStatus(inventory.restore)]
+        if !inventory.inventoryComplete {
+            lines.append("inventory incomplete: some pane is unaccounted for, so nothing can be pruned")
+        }
+        guard !inventory.entries.isEmpty else { return (lines + ["no daemons"]).joined(separator: "\n") }
+        return (lines + [""] + inventory.entries.map(zmxRow)).joined(separator: "\n")
+    }
+
+    /// Carries the ids `zmx kill` needs, not just names: a closed or unindexed row may not appear in `tree`
+    /// at all, and kill resolves a session by id or prefix, never by name — so a table of names alone
+    /// cannot get the user to the next command. Observation stays its OWN column beside the client count,
+    /// which only exists for a running daemon.
+    private static func zmxRow(_ entry: ControlZmxEntry) -> String {
+        let clients = entry.clients.map { "\($0) client\($0 == 1 ? "" : "s")" } ?? "-"
+        var owner = "-"
+        if let sessionID = entry.sessionID {
+            // the full window/workspace/session/pane path: one session name can appear in two workspaces,
+            // and the daemon name alone says nothing about which
+            let window = entry.windowName ?? entry.windowState ?? "?"
+            let path = [window, entry.workspaceName ?? "?", entry.sessionName ?? "?"].joined(separator: " / ")
+            let pane = entry.pane.map { " (\($0))" } ?? ""
+            let windowID = entry.windowID.map { " win \(shortID($0))" } ?? ""
+            owner = "\(shortID(sessionID)) \(path)\(pane)\(windowID)"
+        }
+        let state = entry.windowState.map { "\(entry.state) [\($0) window]" } ?? entry.state
+        let observation = entry.outdated == true ? "\(entry.observation) outdated" : entry.observation
+        return "\(entry.daemon)  \(state)  \(observation)  \(clients)  \(owner)"
+    }
+
+    /// The prefix a caller pastes into `--target`/`--window`. Eight hex digits is not GUARANTEED unique,
+    /// so an ambiguous one is refused by the resolver rather than resolved wrongly; `--json` carries the
+    /// full ids for that case.
+    private static func shortID(_ id: String) -> String { String(id.prefix(8)) }
 
     /// Render the `theme.list` payload as one theme name per line (no trailing newline), the active
     /// theme(s) marked `* `, with a leading "default ghostty" entry for the no-theme (ghostty built-in)
@@ -237,6 +394,31 @@ struct SocketClient {
         guard sync else { return body }
         let header = "syncing with macOS appearance — light: \(light ?? "default ghostty"), dark: \(dark ?? "default ghostty")"
         return header + "\n" + body
+    }
+
+    /// Render the `hooks.list` payload: one row per hook in file order, then parse diagnostics.
+    static func formatHooks(_ hooks: ControlHooks) -> String {
+        var lines = ["hooks: \(hooks.path)"]
+        if hooks.hooks.isEmpty {
+            lines.append("  (no hooks)")
+        }
+        for hook in hooks.hooks {
+            var row = "  line \(hook.line): on \(hook.kind) \(hook.command)"
+            if let pid = hook.runningPid {
+                row += "  running pid \(pid)"
+                if let elapsed = hook.elapsedSeconds { row += " for \(Int(elapsed))s" }
+            }
+            if hook.pending > 0 { row += "  pending \(hook.pending)" }
+            if hook.dropped > 0 { row += "  dropped \(hook.dropped)" }
+            if let failure = hook.lastFailure { row += "  last failure: \(failure)" }
+            if hook.retired == true { row += "  (retired, removed from the file)" }
+            lines.append(row)
+        }
+        if !hooks.diagnostics.isEmpty {
+            lines.append(contentsOf: ["", "diagnostics:"])
+            lines.append(contentsOf: hooks.diagnostics.map { "    line \($0.line): \($0.message)" })
+        }
+        return lines.joined(separator: "\n")
     }
 
     /// Render the `keymap.list` payload as sections: the resolved built-ins, then custom commands, parse
@@ -258,7 +440,14 @@ struct SocketClient {
         }
         if !keymap.commands.isEmpty {
             lines.append(contentsOf: ["", "commands:"])
-            lines.append(contentsOf: keymap.commands.map { "    \($0.name)  \($0.shortcut ?? "(palette only)")" })
+            lines.append(contentsOf: keymap.commands.map { command in
+                var row = "    \(command.name)  \(command.shortcut ?? "(palette only)")"
+                if command.errorHud {
+                    row += "  --error-hud --error-position \(command.errorPosition.rawValue)"
+                    if let pane = command.errorPane { row += " --error-pane \(pane.rawValue)" }
+                }
+                return row
+            })
         }
         if !keymap.diagnostics.isEmpty {
             lines.append(contentsOf: ["", "diagnostics:"])
@@ -305,8 +494,18 @@ struct SocketClient {
                 let realizedTag = session.realized == false ? " (not realized)" : ""
                 let tags = splitTag + realizedTag + (session.overlay ? " (overlay)" : "")
                     + (session.scratch ? " (scratch)" : "")
+                let splitCwdSuffix = session.splitCwd.map { $0 == session.cwd ? "" : "  split cwd: \($0)" } ?? ""
                 let titleSuffix = session.title.map { "  title: \($0)" } ?? ""
-                lines.append("  \(smark) \(session.name)\(tags)  [\(session.id)]  \(session.cwd)\(titleSuffix)")
+                let attribution = session.liveAttribution.map { "  live attribution: \($0)" } ?? ""
+                let splitAttribution = session.splitLiveAttribution.map { "  split live attribution: \($0)" } ?? ""
+                let presentation = session.presentation.map {
+                    "  presentation: \($0.state)" + ($0.mode == "presenter" ? ", presenter" : "")
+                        + ($0.error.map { " (\($0))" } ?? "")
+                } ?? ""
+                let presenters = session.presenters.map {
+                    ($0.presenter == true ? "  presented remotely" : "") + ($0.mirrors > 0 ? "  mirrored by: \($0.mirrors)" : "")
+                } ?? ""
+                lines.append("  \(smark) \(session.name)\(tags)  [\(session.id)]  \(session.cwd)\(splitCwdSuffix)\(titleSuffix)\(attribution)\(splitAttribution)\(presentation)\(presenters)")
             }
         }
         return lines.joined(separator: "\n")

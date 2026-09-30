@@ -16,19 +16,11 @@ struct Session: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Session commands.",
         subcommands: [New.self, Duplicate.self, Close.self, Select.self, Go.self, Rename.self, Reveal.self, Move.self, TypeText.self,
-                      Split.self, Scratch.self, Focus.self, Resize.self, Copy.self, Paste.self, SelectAll.self,
-                      Text.self, Status.self, Restore.self, FlagCommand.self,
+                      Split.self, Swap.self, Lead.self, Scratch.self, Focus.self, Resize.self, Copy.self, Paste.self,
+                      SelectAll.self,
+                      Text.self, Status.self, Restore.self, FlagCommand.self, Context.self,
                       Seen.self, Search.self, Background.self, Overlay.self, Hud.self]
     )
-
-    /// The overlay and HUD arms share one accepted range for `--size-percent`, so the gate belongs to
-    /// neither. `1...100` is the input domain both document; the narrower bound for rendering a HUD is a
-    /// presentation limit applied app-side, not a rejection.
-    static func validateSizePercent(_ sizePercent: Int?) throws {
-        if let sizePercent, !(1...100).contains(sizePercent) {
-            throw ValidationError("--size-percent must be between 1 and 100")
-        }
-    }
 
     struct New: RequestCommand {
         static let configuration = CommandConfiguration(abstract: "Create a session.")
@@ -206,16 +198,16 @@ struct Session: ParsableCommand {
         func validate() throws { try validatePaneArgument(pane) }
 
         func makeRequest() throws -> ControlRequest {
-            let payload: String
             if stdin {
-                // non-UTF8 stdin decodes to nil and injects nothing — terminal input is UTF-8 text.
-                let data = FileHandle.standardInput.readDataToEndOfFile()
-                payload = String(data: data, encoding: .utf8) ?? ""
-            } else if let text {
-                payload = text
-            } else {
-                throw ValidationError("provide TEXT or --stdin")
+                return try makeRequest(input: FileHandle.standardInput.readDataToEndOfFile())
             }
+            guard let text else { throw ValidationError("provide TEXT or --stdin") }
+            return makeRequest(payload: text)
+        }
+
+        func makeRequest(input: Data) throws -> ControlRequest { makeRequest(payload: try decodeTypedStdin(input)) }
+
+        private func makeRequest(payload: String) -> ControlRequest {
             return ControlRequest(cmd: .sessionType, target: target.target,
                                   args: options.withWindow(ControlArgs(text: payload, select: select, pane: pane)))
         }
@@ -288,7 +280,7 @@ struct Session: ParsableCommand {
     struct Resize: RequestCommand {
         static let configuration = CommandConfiguration(
             abstract: "Resize a split session's divider (set or nudge the primary-pane fraction).")
-        @Option(name: .customLong("split-ratio"), help: "Absolute primary-pane fraction 0..1 (left or top; e.g. 0.7). Clamped to 0.05..0.95.") var splitRatio: Double?
+        @Option(name: .customLong("split-ratio"), help: "Absolute primary-pane fraction 0..1 of the area below the titlebar (left or top; e.g. 0.7). Clamped to 0.05..0.95.") var splitRatio: Double?
         @Option(name: .customLong("grow-left"), help: "Grow the left pane by this fraction (e.g. 0.05); shrinks the right.") var growLeft: Double?
         @Option(name: .customLong("grow-right"), help: "Grow the right pane by this fraction (e.g. 0.05); shrinks the left.") var growRight: Double?
         @Option(name: .customLong("grow-primary"), help: "Grow the primary pane by this fraction.") var growPrimary: Double?
@@ -338,11 +330,15 @@ struct Session: ParsableCommand {
 
     struct Paste: RequestCommand {
         static let configuration = CommandConfiguration(abstract: "Paste the system clipboard into a session (like ⌘V).")
+        @Option(name: .long, help: "Which pane to paste into: primary/left/top, split/right/bottom, or scratch (even when hidden). Defaults to primary.") var pane: String?
         @OptionGroup var target: TargetOptions
         @OptionGroup var options: ClientOptions
 
+        func validate() throws { try validatePaneArgument(pane) }
+
         func makeRequest() throws -> ControlRequest {
-            ControlRequest(cmd: .sessionPaste, target: target.target, args: options.withWindow())
+            ControlRequest(cmd: .sessionPaste, target: target.target,
+                           args: options.withWindow(pane.map { ControlArgs(pane: $0) }))
         }
     }
 
@@ -362,6 +358,8 @@ struct Session: ParsableCommand {
         @Flag(name: .long, help: "Read the full screen + scrollback instead of just the visible screen.") var all = false
         @Option(name: .long, help: "Keep only the last N lines of the full buffer.") var lines: Int?
         @Option(name: .long, help: "Which pane to read: primary/left/top, split/right/bottom, or scratch (even when hidden). Defaults to the on-screen pane.") var pane: String?
+        @Option(name: .customLong("pane-id"), help: "Stable pane token ($AGTERM_PANE_ID); overrides --pane when it resolves.")
+        var paneID: String?
         @OptionGroup var target: TargetOptions
         @OptionGroup var options: ClientOptions
 
@@ -377,130 +375,8 @@ struct Session: ParsableCommand {
 
         func makeRequest() throws -> ControlRequest {
             ControlRequest(cmd: .sessionText, target: target.target,
-                           args: options.withWindow(ControlArgs(pane: pane, all: all ? true : nil, lines: lines)))
-        }
-    }
-
-    struct Status: RequestCommand {
-        static let configuration = CommandConfiguration(abstract: "Set a session's agent status indicator.")
-        @Argument(help: "State: idle, active, completed, or blocked.") var state: String
-        @Flag(name: .long, help: "Pulse the indicator for attention.") var blink = false
-        @Flag(name: .long, help: "Reset the indicator to idle once the session is visited.") var autoReset = false
-        @Option(name: .long, help: """
-            Play a sound when set: 'default' (or 'beep') for the system alert sound, or a system sound \
-            name (Basso, Blow, Bottle, Frog, Funk, Glass, Hero, Morse, Ping, Pop, Purr, Sosumi, \
-            Submarine, Tink).
-            """)
-        var sound: String?
-        @Option(name: .long, help: "Override the glyph tint for this call only (#rrggbb); reverts on the next status set without it.")
-        var color: String?
-        @Option(name: .long, help: """
-            Override the glyph silhouette for this call only: \
-            \(StatusShape.validNamesPhrase); \
-            reverts on the next status set without it.
-            """)
-        var shape: String?
-        @Option(name: .long, help: """
-            Which pane set this status: primary/left/top, split/right/bottom, or scratch. Records the blocked \
-            pane so navigation reaches it. Defaults to primary.
-            """)
-        var pane: String?
-        @Option(name: .customLong("pane-id"), help: """
-            A surface's stable token (the shell's $AGTERM_PANE_ID) — the agent-status hook forwards it so a \
-            status set from a promoted-then-re-split pane lands on the pane's current slot. Overrides --pane \
-            when it resolves; falls back to --pane otherwise.
-            """)
-        var paneID: String?
-        @OptionGroup var target: TargetOptions
-        @OptionGroup var options: ClientOptions
-
-        func validate() throws {
-            if let color, !WatermarkConfig.isValidColorHex(color) {
-                throw ValidationError("color must be a #rrggbb hex value")
-            }
-            if let shape, StatusShape(rawValue: shape) == nil {
-                throw ValidationError("shape must be one of: \(StatusShape.validNamesPhrase)")
-            }
-            try validatePaneArgument(pane)
-        }
-
-        func makeRequest() throws -> ControlRequest {
-            ControlRequest(cmd: .sessionStatus, target: target.target,
-                           args: options.withWindow(ControlArgs(pane: pane, paneID: paneID, status: state,
-                                                                 blink: blink ? true : nil,
-                                                                 autoReset: autoReset ? true : nil, sound: sound,
-                                                                 color: color, shape: shape)))
-        }
-    }
-
-    /// The per-session, per-pane restore-command override. Nested under `Session`, a different verb from the
-    /// top-level `restore clear` (app-global and capture-scoped; this one per-session and override-scoped).
-    struct Restore: RequestCommand {
-        static let configuration = CommandConfiguration(
-            abstract: "Pin the command a session's pane re-runs on the next launch.",
-            discussion: """
-            session restore "claude --resume ID"   pin a shell line for the next launch
-            session restore --none                 pin to nothing (the pane restores a plain shell)
-            session restore --clear                drop the override, back to auto-capture
-
-            The override is written now and consumed on the NEXT launch — it never touches the running \
-            session. It wins over the pane's captured foreground command, is gated on the \
-            restore-running-command setting, and reads back on `tree` as restoreCommand (main pane) or \
-            splitRestoreCommand (split pane). It is STICKY: it fires again on every launch until cleared.
-
-            COMMAND is shell code, stored verbatim in the window's state file and readable via `tree`, so \
-            it must not carry secrets.
-
-            Not to be confused with `agtermctl restore clear`, which is app-global and clears every \
-            session's CAPTURED foreground command; this one is per-session and clears only the override.
-            """)
-        @Argument(help: "Shell line to run on the next launch (omit with --none or --clear).") var command: String?
-        @Flag(name: .long, help: "Pin the pane to nothing: it restores a plain shell, suppressing the captured command.") var none = false
-        @Flag(name: .long, help: "Drop the override so the pane goes back to restoring its captured foreground command.") var clear = false
-        @Option(name: .long, help: "Which pane to pin: primary/left/top or split/right/bottom; scratch is rejected. Defaults to primary.") var pane: String?
-        @Option(name: .customLong("pane-id"), help: """
-            A surface's stable token (the shell's $AGTERM_PANE_ID) — resolves to the pane's CURRENT slot, \
-            so a hook in a promoted-then-re-split pane still pins the right one. Unlike `session status`, \
-            a token that does not resolve is an error unless --pane is also given as the fallback.
-            """)
-        var paneID: String?
-        @OptionGroup var target: TargetOptions
-        @OptionGroup var options: ClientOptions
-
-        // exactly one of the three forms; reject neither/multiple at parse time so it's a clean usage
-        // error, unit-testable without a socket (the dispatcher enforces the same modes server-side).
-        func validate() throws {
-            guard [command != nil, none, clear].filter({ $0 }).count == 1 else {
-                throw ValidationError("provide exactly one of a COMMAND, --none, or --clear")
-            }
-            try validatePaneArgument(pane)
-        }
-
-        func makeRequest() throws -> ControlRequest {
-            // validate() guarantees the forms are exclusive, so `command` is nil for none/clear.
-            let mode = none ? "none" : clear ? "clear" : "set"
-            return ControlRequest(cmd: .sessionRestore, target: target.target,
-                                  args: options.withWindow(ControlArgs(mode: mode, command: command,
-                                                                        pane: pane, paneID: paneID)))
-        }
-    }
-
-    // named `FlagCommand` (not `Flag`) so it doesn't shadow ArgumentParser's `@Flag` wrapper within
-    // the `Session` namespace; `commandName` keeps the user-facing verb `flag`.
-    struct FlagCommand: RequestCommand {
-        static let configuration = CommandConfiguration(commandName: "flag", abstract: "Flag a session for the flagged working-set view (on|off|toggle|clear).")
-        @Argument(help: "Mode: on, off, toggle (default), or clear (unflag all; ignores --target).") var mode: String = "toggle"
-        @OptionGroup var target: TargetOptions
-        @OptionGroup var options: ClientOptions
-
-        func validate() throws {
-            guard ["on", "off", "toggle", "clear"].contains(mode) else {
-                throw ValidationError("mode must be on, off, toggle, or clear")
-            }
-        }
-
-        func makeRequest() throws -> ControlRequest {
-            ControlRequest(cmd: .sessionFlag, target: target.target, args: options.withWindow(ControlArgs(mode: mode)))
+                           args: options.withWindow(ControlArgs(pane: pane, paneID: paneID,
+                                                               all: all ? true : nil, lines: lines)))
         }
     }
 
@@ -549,6 +425,10 @@ struct Session: ParsableCommand {
             subcommands: [Image.self, Text.self, Color.self, Clear.self]
         )
 
+        static let paneHelp = "Set only this pane's override: left, right, or scratch (primary/top and split/bottom "
+            + "are aliases). Omitted sets the session default, which every pane without an override inherits; "
+            + "`clear --pane` returns that pane to the default."
+
         /// Shared input validation against the host-free `WatermarkConfig`, so a bad value is a clean parse
         /// error before any socket round-trip, matching the server's rejection exactly. The enum checks
         /// reject `""` too, so no separate empty-string case is needed.
@@ -581,14 +461,18 @@ struct Session: ParsableCommand {
             @Option(name: .long, help: "Fit: contain (default), cover, stretch, or none.") var fit: String?
             @Option(name: .long, help: "Position: center (default) or an edge/corner anchor (top-left, bottom-right, …).") var position: String?
             @Flag(name: .customLong("repeat"), help: "Tile the image to fill blank space.") var repeatImage = false
+            @Option(name: .long, help: ArgumentHelp(Background.paneHelp)) var pane: String?
             @OptionGroup var target: TargetOptions
             @OptionGroup var options: ClientOptions
 
-            func validate() throws { try Background.validate(fit: fit, position: position, opacity: opacity, path: path) }
+            func validate() throws {
+                try Background.validate(fit: fit, position: position, opacity: opacity, path: path)
+                try validatePaneArgument(pane)
+            }
 
             func makeRequest() throws -> ControlRequest {
                 ControlRequest(cmd: .sessionBackground, target: target.target,
-                               args: options.withWindow(ControlArgs(mode: "image", path: path, opacity: opacity,
+                               args: options.withWindow(ControlArgs(mode: "image", pane: pane, path: path, opacity: opacity,
                                                                     fit: fit, position: position,
                                                                     repeats: repeatImage ? true : nil)))
             }
@@ -601,16 +485,18 @@ struct Session: ParsableCommand {
             @Option(name: .long, help: "Opacity 0.0-1.0 (default 1.0).") var opacity: Double?
             @Option(name: .long, help: "Fit: contain (default), cover, stretch, or none.") var fit: String?
             @Option(name: .long, help: "Position: center (default) or an edge/corner anchor (top-left, bottom-right, …).") var position: String?
+            @Option(name: .long, help: ArgumentHelp(Background.paneHelp)) var pane: String?
             @OptionGroup var target: TargetOptions
             @OptionGroup var options: ClientOptions
 
             func validate() throws {
                 try Background.validate(fit: fit, position: position, opacity: opacity, color: color, text: text)
+                try validatePaneArgument(pane)
             }
 
             func makeRequest() throws -> ControlRequest {
                 ControlRequest(cmd: .sessionBackground, target: target.target,
-                               args: options.withWindow(ControlArgs(text: text, mode: "text", color: color,
+                               args: options.withWindow(ControlArgs(text: text, mode: "text", pane: pane, color: color,
                                                                     opacity: opacity, fit: fit, position: position)))
             }
         }
@@ -619,25 +505,32 @@ struct Session: ParsableCommand {
             static let configuration = CommandConfiguration(
                 abstract: "Set a solid background color for the terminal (honors the Settings window translucency).")
             @Argument(help: "Background color as #rrggbb.") var color: String
+            @Option(name: .long, help: ArgumentHelp(Background.paneHelp)) var pane: String?
             @OptionGroup var target: TargetOptions
             @OptionGroup var options: ClientOptions
 
-            func validate() throws { try Background.validate(color: color) }
+            func validate() throws {
+                try Background.validate(color: color)
+                try validatePaneArgument(pane)
+            }
 
             func makeRequest() throws -> ControlRequest {
                 ControlRequest(cmd: .sessionBackground, target: target.target,
-                               args: options.withWindow(ControlArgs(mode: "color", color: color)))
+                               args: options.withWindow(ControlArgs(mode: "color", pane: pane, color: color)))
             }
         }
 
         struct Clear: RequestCommand {
             static let configuration = CommandConfiguration(abstract: "Remove the session's background (watermark or solid color).")
+            @Option(name: .long, help: ArgumentHelp(Background.paneHelp)) var pane: String?
             @OptionGroup var target: TargetOptions
             @OptionGroup var options: ClientOptions
 
+            func validate() throws { try validatePaneArgument(pane) }
+
             func makeRequest() throws -> ControlRequest {
                 ControlRequest(cmd: .sessionBackground, target: target.target,
-                               args: options.withWindow(ControlArgs(mode: "clear")))
+                               args: options.withWindow(ControlArgs(mode: "clear", pane: pane)))
             }
         }
     }
@@ -645,7 +538,8 @@ struct Session: ParsableCommand {
     struct Overlay: ParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Open, read, resize, or close an ephemeral overlay terminal on a session.",
-            subcommands: [Open.self, Close.self, Resize.self, Result.self, Copy.self, Text.self]
+            subcommands: [Open.self, Close.self, Resize.self, Reload.self, Navigate.self, Result.self, Submit.self, Copy.self,
+                          Text.self, RunJob.self]
         )
 
         /// `--pane` validation for the overlay commands: the two pane roles only, deliberately NOT the shared
@@ -658,11 +552,25 @@ struct Session: ParsableCommand {
         }
 
         struct Open: RequestCommand {
-            static let configuration = CommandConfiguration(abstract: "Open an overlay running COMMAND; it closes when COMMAND exits.")
-            @Argument(help: "Program to run in the overlay (e.g. revdiff).") var command: String
-            @Option(name: .long, help: "Working directory (default: the session's current directory).") var cwd: String?
+            static let configuration = CommandConfiguration(
+                abstract: "Open an overlay running COMMAND (it closes when COMMAND exits), or showing a page with --html or --url.")
+            @Argument(help: "Program to run in the overlay (e.g. revdiff); omit with --html or --url.") var command: String?
+            @Option(name: .long, help: "Show this local HTML file instead of running COMMAND.") var html: String?
+            @Option(name: .long, help: """
+                Show this http or https URL instead of running COMMAND; links to its own origin load in place. \
+                localhost means the Mac running agterm.
+                """)
+            var url: String?
+            @Flag(name: .long, help: "With --html or --url, add back, forward, reload, open in browser, and Show in Finder or Copy Link buttons.")
+            var navigation = false
+            @Flag(name: .customLong("js"), help: "With --html or --url, let the page run its own JavaScript (off by default).") var javascript = false
+            @Option(name: .long, help: """
+                Working directory (default: the session's current directory). With --html, grants read access \
+                inside this directory; relative links resolve beside FILE. Without --cwd, the page has no file access.
+                """)
+            var cwd: String?
             @Flag(name: .long, help: "Keep the overlay open after COMMAND exits (press any key to close).") var wait = false
-            @Flag(name: .long, help: "Block until COMMAND exits and exit with its status (the program renders normally; capture its output via the program's own output file).") var block = false
+            @Flag(name: .long, help: Open.blockHelp) var block = false
             @Flag(name: .long, help: "Select (switch to) the target session after opening the overlay (default: open without switching).") var follow = false
             @Option(name: .long, help: "Render a floating, framed panel at PERCENT (1-100) of the pane instead of full-size.") var sizePercent: Int?
             @Option(name: .long, help: "Solid background color (#rrggbb) for the overlay pane, independent of the session's own.") var backgroundColor: String?
@@ -679,6 +587,13 @@ struct Session: ParsableCommand {
             // so it's a clean usage error and is unit-testable without a socket.
             func validate() throws {
                 if block && wait { throw ValidationError("--block cannot be combined with --wait") }
+                if [command, html, url].compactMap({ $0 }).count != 1 {
+                    throw ValidationError("provide exactly one of COMMAND, --html or --url")
+                }
+                if command == nil, wait || (url != nil && block) { throw ValidationError("a page takes no --wait, and a --url page no --block") }
+                if navigation, command != nil { throw ValidationError("--navigation requires --html or --url") }
+                if javascript, command != nil { throw ValidationError("--js requires --html or --url") }
+                if url != nil, cwd != nil { throw ValidationError("--cwd cannot be combined with --url") }
                 if let backgroundColor, !WatermarkConfig.isValidColorHex(backgroundColor) {
                     throw ValidationError("background-color must be a #rrggbb hex value")
                 }
@@ -691,9 +606,13 @@ struct Session: ParsableCommand {
 
             func makeRequest() throws -> ControlRequest {
                 ControlRequest(cmd: .sessionOverlayOpen, target: target.target,
-                               args: options.withWindow(ControlArgs(cwd: cwd, command: command, wait: wait ? true : nil,
+                               args: options.withWindow(ControlArgs(cwd: html == nil ? cwd : cwd.map(Overlay.absolutePath),
+                                                                     command: command, wait: wait ? true : nil,
                                                                      sizePercent: sizePercent, follow: follow ? true : nil,
-                                                                     pane: pane, color: backgroundColor)))
+                                                                     pane: pane, color: backgroundColor,
+                                                                     html: html.map(Overlay.absolutePath),
+                                                                     navigation: navigation ? true : nil, url: url,
+                                                                     javascript: javascript ? true : nil)))
             }
 
             /// The `--block` poll request. Extracted from `run()` so the `--pane` forwarding is assertable
@@ -706,27 +625,28 @@ struct Session: ParsableCommand {
 
             func run() throws {
                 guard block else { try defaultRun(); return }
+                if html != nil { return try HtmlPageRunner(json: options.json, send: SocketClient(path: options.socketPath()).send).block(makeRequest()) }
                 let client = SocketClient(path: options.socketPath())
                 // open via the same `makeRequest()` as the non-block path: in block mode `validate()` guarantees
                 // `!wait`, so its `wait` is nil, and the floating `--size-percent` rides that single source
                 // instead of a duplicated ControlArgs.
                 let opened = try client.send(makeRequest())
-                guard opened.ok, let id = opened.result?.id else {
+                guard opened.response.ok, let id = opened.response.result?.id else {
                     SocketClient.printResponse(opened, json: options.json)
                     throw ExitCode.failure
                 }
                 while true {
                     let res = try client.send(resultRequest(id: id))
-                    if res.ok {
+                    if res.response.ok {
                         if options.json { SocketClient.printResponse(res, json: true) }
                         // a successful result must carry the status; its absence is a protocol violation, not success.
-                        guard let code = res.result?.exitCode else {
+                        guard let code = res.response.result?.exitCode else {
                             FileHandle.standardError.write(Data("error: result missing exit code\n".utf8))
                             throw ExitCode.failure
                         }
                         throw ExitCode(rawValue: Int32(code))
                     }
-                    if res.error == OverlayResultError.stillRunning {
+                    if res.response.error == OverlayResultError.stillRunning {
                         Thread.sleep(forTimeInterval: 0.1)
                         continue
                     }
@@ -737,7 +657,7 @@ struct Session: ParsableCommand {
         }
 
         struct Close: RequestCommand {
-            static let configuration = CommandConfiguration(abstract: "Close the overlay terminal (destroys it).")
+            static let configuration = CommandConfiguration(abstract: "Close the overlay terminal (destroys it; for one shown on another Mac, requests its cancel).")
             @Option(name: .long, help: "Close that split pane's overlay (primary/left/top or split/right/bottom); omit for the session-wide overlay.")
             var pane: String?
             @OptionGroup var target: TargetOptions
@@ -773,18 +693,12 @@ struct Session: ParsableCommand {
         }
 
         struct Result: RequestCommand {
-            static let configuration = CommandConfiguration(abstract: "Print the overlay program's exit status (errors if it is still running or never ran).")
+            static let configuration = CommandConfiguration(abstract: "Print the overlay program's exit status, or with --page an HTML page's outcome.")
             @Option(name: .long, help: "Read that split pane's overlay status (primary/left/top or split/right/bottom); omit for the session-wide overlay.")
             var pane: String?
+            @Option(name: .long, help: "Read the outcome of the HTML page with this id, as a --block open prints it.") var page: String?
             @OptionGroup var target: TargetOptions
             @OptionGroup var options: ClientOptions
-
-            func validate() throws { try Overlay.validatePane(pane) }
-
-            func makeRequest() throws -> ControlRequest {
-                ControlRequest(cmd: .sessionOverlayResult, target: target.target,
-                               args: options.withWindow(pane.map { ControlArgs(pane: $0) }))
-            }
         }
 
         struct Copy: RequestCommand {
@@ -867,6 +781,14 @@ struct Session: ParsableCommand {
             }
         }
 
+        /// Rejects what cannot be scheduled rather than clamping it, matching the dispatcher so the same value
+        /// fails the same way over a raw socket.
+        static func validateHideAfter(_ seconds: Double?) throws {
+            if let seconds, !HudSpec.isValidHideAfter(seconds) {
+                throw ValidationError("hide-after must be 0...\(Int(HudSpec.maxHideAfter)) seconds")
+            }
+        }
+
         /// The one spinner value the socket carries, from the two ways to ask for one: `--spinner-style`
         /// names it and turns it on by itself, so the bare `--spinner` flag is only needed for the default.
         /// Nil when neither is given, which is the static panel.
@@ -879,10 +801,51 @@ struct Session: ParsableCommand {
             return style ?? (spinner ? HudSpinner.defaultStyle.rawValue : nil)
         }
 
+        static func validateMessageSource(_ message: String?, file: String?) throws {
+            if message == nil, file == nil { throw ValidationError("provide MESSAGE or --file") }
+            if message != nil, file != nil { throw ValidationError("MESSAGE and --file are mutually exclusive") }
+        }
+
+        /// messageText is the argument, or the UTF-8 contents of `file` with CRLF line endings normalized and
+        /// one trailing newline dropped: files end with one, and a plain panel rejects newlines. The dispatcher still applies every cap and rejection.
+        static func messageText(_ message: String?, file: String?) throws -> String {
+            guard let file else { return message ?? "" }
+            let data: Data
+            do {
+                data = try Data(contentsOf: URL(fileURLWithPath: file))
+            } catch {
+                throw ValidationError("cannot read --file \(file): \(error.localizedDescription)")
+            }
+            guard var text = String(data: data, encoding: .utf8) else {
+                throw ValidationError("--file \(file) is not valid UTF-8")
+            }
+            text = text.replacingOccurrences(of: "\r\n", with: "\n")
+            if text.hasSuffix("\n") { text.removeLast() }
+            return text
+        }
+
+        static func validateFontSize(_ points: Double?) throws {
+            if let points, !HudSpec.isValidFontSize(points) {
+                throw ValidationError(
+                    "font-size must be \(Int(HudSpec.fontSizeRange.lowerBound))...\(Int(HudSpec.fontSizeRange.upperBound)) points")
+            }
+        }
+
         struct Open: RequestCommand {
             static let configuration = CommandConfiguration(
                 abstract: "Post a message panel over the session; the session keeps focus and stays typable.")
-            @Argument(help: "Message shown in the panel.") var message: String
+            @Argument(help: "Message shown in the panel (omit with --file).") var message: String?
+            @Option(name: .long, help: "Read the message from FILE instead of the argument.") var file: String?
+            @Flag(name: .long, help: """
+                Render the message as markdown, up to \(HudSpec.maxMarkdownLength) characters. A single newline \
+                inside a paragraph is a soft break; end a line with two spaces or a backslash to break it.
+                """)
+            var markdown = false
+            @Option(name: .customLong("font-size"), help: """
+                The panel's own font size in points, \(Int(HudSpec.fontSizeRange.lowerBound))-\
+                \(Int(HudSpec.fontSizeRange.upperBound)); omit to use the session's. Fixed for the panel's life.
+                """)
+            var fontSize: Double?
             @Option(name: .long, help: "Dim second line under the message (e.g. what the caller is waiting on).") var detail: String?
             @Flag(name: .long, help: "Animate a spinner glyph in the panel, in the default style.")
             var spinner = false
@@ -908,6 +871,15 @@ struct Session: ParsableCommand {
                 and never covers the session. Height always follows the message.
                 """)
             var sizePercent: Int?
+            @Option(name: .long, help: "Anchor inside primary/left/top or split/right/bottom; omit for the whole session.")
+            var pane: String?
+            @Option(name: .customLong("pane-id"), help: "Stable pane token ($AGTERM_PANE_ID); overrides --pane when it resolves.")
+            var paneID: String?
+            @Option(name: .customLong("hide-after"), help: """
+                Take the panel down by itself after SECONDS, 0...\(Int(HudSpec.maxHideAfter)); omit or 0 to \
+                leave it up until something closes it. The clock runs whether or not the session is on screen.
+                """)
+            var hideAfter: Double?
             @OptionGroup var target: TargetOptions
             @OptionGroup var options: ClientOptions
 
@@ -918,26 +890,35 @@ struct Session: ParsableCommand {
                 try Hud.validateTextColor(textColor)
                 try Hud.validatePosition(position)
                 try Hud.validateSpinnerStyle(spinnerStyle)
+                try Hud.validateHideAfter(hideAfter)
+                try Hud.validateMessageSource(message, file: file)
+                try Hud.validateFontSize(fontSize)
                 try Session.validateSizePercent(sizePercent)
+                try Overlay.validatePane(pane)
             }
 
             func makeRequest() throws -> ControlRequest {
                 ControlRequest(cmd: .sessionHudOpen, target: target.target,
                                args: options.withWindow(ControlArgs(
-                                   sizePercent: sizePercent, message: message, detail: detail,
-                                   spinner: Hud.spinnerValue(spinner: spinner, style: spinnerStyle),
-                                   color: backgroundColor, textColor: textColor, position: position)))
+                                   sizePercent: sizePercent, message: try Hud.messageText(message, file: file),
+                                   detail: detail, spinner: Hud.spinnerValue(spinner: spinner, style: spinnerStyle),
+                                   hideAfter: hideAfter, markdown: markdown ? true : nil,
+                                   pane: pane, paneID: paneID, color: backgroundColor,
+                                   textColor: textColor, position: position, fontSize: fontSize)))
             }
         }
 
         /// Repaints the live panel in place. An update replaces the whole message, so every argument it
-        /// accepts must be repeated to survive — including `--spinner` and `--text-color`.
+        /// accepts must be repeated to survive, including `--spinner`, `--text-color`, and pane scope.
         /// `--background-color` is deliberately absent: the surface reads it once at creation, so only a
         /// fresh `hud` can change it, while the text color rides the header the helper re-reads every tick.
         struct Update: RequestCommand {
             static let configuration = CommandConfiguration(
                 abstract: "Replace the panel's text in place (no re-spawn, no blink).")
-            @Argument(help: "New message; it replaces the old one entirely.") var message: String
+            @Argument(help: "New message; it replaces the old one entirely (omit with --file).") var message: String?
+            @Option(name: .long, help: "Read the new message from FILE instead of the argument.") var file: String?
+            @Flag(name: .long, help: "Render the message as markdown; omit to return the panel to plain text.")
+            var markdown = false
             @Option(name: .long, help: "Dim second line under the message; omit to drop the old one.") var detail: String?
             @Flag(name: .long, help: "Keep (or start) the spinner in the default style; omit to stop it.")
             var spinner = false
@@ -954,6 +935,15 @@ struct Session: ParsableCommand {
                 and never covers the session. Height always follows the message.
                 """)
             var sizePercent: Int?
+            @Option(name: .long, help: "Anchor inside primary/left/top or split/right/bottom; omit to return to whole-session placement.")
+            var pane: String?
+            @Option(name: .customLong("pane-id"), help: "Stable pane token ($AGTERM_PANE_ID); repeat it on update to keep pane scope.")
+            var paneID: String?
+            @Option(name: .customLong("hide-after"), help: """
+                Restart the panel's auto-hide at SECONDS, 0...\(Int(HudSpec.maxHideAfter)); omit or 0 to \
+                cancel it, like every other option an update replaces rather than patches.
+                """)
+            var hideAfter: Double?
             @OptionGroup var target: TargetOptions
             @OptionGroup var options: ClientOptions
 
@@ -961,15 +951,19 @@ struct Session: ParsableCommand {
                 try Hud.validateTextColor(textColor)
                 try Hud.validatePosition(position)
                 try Hud.validateSpinnerStyle(spinnerStyle)
+                try Hud.validateHideAfter(hideAfter)
+                try Hud.validateMessageSource(message, file: file)
                 try Session.validateSizePercent(sizePercent)
+                try Overlay.validatePane(pane)
             }
 
             func makeRequest() throws -> ControlRequest {
                 ControlRequest(cmd: .sessionHudUpdate, target: target.target,
                                args: options.withWindow(ControlArgs(
-                                   sizePercent: sizePercent, message: message, detail: detail,
-                                   spinner: Hud.spinnerValue(spinner: spinner, style: spinnerStyle),
-                                   textColor: textColor, position: position)))
+                                   sizePercent: sizePercent, message: try Hud.messageText(message, file: file),
+                                   detail: detail, spinner: Hud.spinnerValue(spinner: spinner, style: spinnerStyle),
+                                   hideAfter: hideAfter, markdown: markdown ? true : nil,
+                                   pane: pane, paneID: paneID, textColor: textColor, position: position)))
             }
         }
 
@@ -982,6 +976,17 @@ struct Session: ParsableCommand {
             func makeRequest() throws -> ControlRequest {
                 ControlRequest(cmd: .sessionHudClose, target: target.target, args: options.withWindow())
             }
+        }
+    }
+}
+
+extension Session {
+    /// The overlay and HUD arms share one accepted range for `--size-percent`, so the gate belongs to
+    /// neither. `1...100` is the input domain both document; the narrower bound for rendering a HUD is a
+    /// presentation limit applied app-side, not a rejection.
+    static func validateSizePercent(_ sizePercent: Int?) throws {
+        if let sizePercent, !(1...100).contains(sizePercent) {
+            throw ValidationError("--size-percent must be between 1 and 100")
         }
     }
 }

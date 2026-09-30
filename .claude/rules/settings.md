@@ -26,8 +26,14 @@ paths:
   writing a mode clears the legacy field.
 - Default-on nil fields are `notificationsEnabled`, `notificationBadgeEnabled`, `rightClickPaste`, and
   `workspaceRowClickExpands`, whose mirror gates the sidebar row-click toggle only ([[sidebar]]).
-  Default-off nil fields include attention button, Dock bounce, restore commands, global config
-  inheritance, close confirmation, auto-follow, hidden inactive sidebars, and interface hiding.
+  Default-off nil fields include attention button, Dock bounce, global config inheritance, close
+  confirmation, auto-follow, hidden inactive sidebars, and interface hiding. `restoreMode` defaults to
+  `none`; the legacy `restoreRunningCommand` boolean migrates to `rerun` or `none`.
+- `newSessionPlacement` (nil = `end`) applies only to New Session: `AppActions.newSession()` and the
+  workspace row's New Session and "+", through `AppActions.resolvedNewSessionIndex`. It inserts after the
+  selection only when that lives in the destination workspace. Open Directory, folder drops, and
+  `open -a agterm <dir>` keep appending; `session new` keeps its own `--after`/`--before` rules.
+  Deliberate control exemption, like `newSessionDirectory`: no command sets or reads it.
 - `sidebarFontSize` and `interfaceFontSize` are separate settings, both 9...20 default 13, read through
   `effectiveSidebarFontSize`/`effectiveInterfaceFontSize`. Neither falls back to the other: the sidebar
   is a density knob, the palette a readability one.
@@ -87,13 +93,16 @@ paths:
   contract, so freeing it risks a crash and the rare leak is accepted.
 - `.agtermAppearanceChanged` is required because terminal color is not observable; it updates
   `terminalColor`, quick-terminal backing, title/window appearance, and non-observable chrome mirrors.
-- Settings is a 540x640 six-tab SwiftUI scene with explicit selection defaulting General, preventing
+- Settings is a 540x680 six-tab SwiftUI scene with explicit selection defaulting General, preventing
   `com_apple_SwiftUI_Settings_selectedTabIndex` persistence. General holds Mouse, Sessions, and Ghostty
   Config. Appearance holds Terminal and Window. Interface groups `InterfaceElement`s two per row, plus
   Multiple Windows and the quick terminal's panel size, which sits there rather than under Appearance's
   Window because the panel belongs to no window.
   Notifications holds banner/badge/attention/bounce/sound. Agent Status holds colors/shapes, sound,
-  auto-follow, and Reset. Key Mapping holds config directory, diagnostics, and Reload.
+  status reset, auto-follow, and Reset. Key Mapping holds config directory, diagnostics, and Reload.
+- `statusReset` stores a raw `StatusReset` (`firstKey`|`enter`|`never`), nil for the default `firstKey`,
+  resolved by `effectiveStatusReset` and mirrored to `GhosttyApp.statusReset`, which the surface factories'
+  keystroke-clear closure reads at keystroke time. Reset to defaults clears it with the glyph settings.
 - Keep titlebar construction in `WindowContentView+Titlebar.swift` so `WindowContentView.swift` remains
   below the 1000-line limit.
 - Keep Agent Status shape pickers in a trailing-aligned 80-point column wider than the 64.5...68-point
@@ -132,7 +141,13 @@ paths:
   libghostty diagnostics across all sources, clear all session zoom, post appearance change, and notify
   non-zero diagnostics. A config-directory change reloads both co-located files. Launch also reports
   cached diagnostics.
-- **Restore running commands is opt-in. Replay is launch-scoped; capture runs at two exits and on demand.**
+- **Process restore mode is frozen at launch; capture follows the configured next mode.** `none` restores fresh shells, `rerun` uses the captured-command path
+  below, and `live` is zmx-backed. Settings changes apply after restart. A live request falls back to
+  `none` when the bundled executable, zsh integration, or password-database login shell is unsupported, and
+  Settings reports the reason. The requested-live latch still claims persisted daemons during fallback; only
+  a deliberate `none` or `rerun` launch reaps them. Factories, control status, and reap read the immutable
+  requested or active mode. Exit capture and `restore.capture` read the configured next-launch mode.
+- **Command replay is launch-scoped; capture runs at two exits and on demand.**
   `AppDelegate.captureForegroundCommands` runs at three points: `applicationWillTerminate` before
   `saveAllOpen()`, the LAST window's `willClose` before its surface teardown, which precedes
   `applicationWillTerminate` and is therefore the only point where a close-the-last-window exit's
@@ -141,16 +156,19 @@ paths:
   that set — since #447 it reaches `applicationWillTerminate` like any quit — so do not re-motivate the
   command with an OS update. The on-demand arm changes nothing else: it fills the same
   slots, persists through the same `saveAllOpen`, and replay stays launch-only and one-shot.
-  All three arms are gated on the setting, and only the on-demand one SAYS so: it refuses while the
-  setting is off rather than capturing what nothing would replay. Deliberately unlike a `session.restore`
-  pin, which succeeds with an explanatory note in the same state, because a pin outlives the toggle and
-  a capture only goes stale.
+  The two automatic exit arms run when the configured mode is `rerun` or `live`. The on-demand arm remains
+  rerun-only: it refuses when `none` or `live` is configured and names that mode. Deliberately unlike a
+  `session.restore` pin, which saves future rerun policy with an explanatory note, because a pin outlives
+  the mode and a capture only goes stale.
   The `willClose` arm alone is guarded by `openIDs() == [windowID]` and skipped under `isTerminating`.
   A NON-last close captures nothing AND clears both persisted slots plus the pending pair: a launch
   restore can't tell that window's file from one open at exit, so its argv could replay via the
   never-windowless reopen fallback, and on demand a capture can now have written argv there mid-run.
-  Argv comes from `ghostty_surface_foreground_pid`, `sysctl(KERN_PROCARGS2)`, and host-free parsing.
-  Capture no hidden split.
+  Ordinary and rerun argv comes from `ghostty_surface_foreground_pid`, `sysctl(KERN_PROCARGS2)`, and
+  host-free parsing. Live panes use one fresh zmx leader snapshot, then the same sysctl parsing against the
+  daemon-side leaders. A live hidden split is captured while its backing surface exists; an ordinary or
+  rerun hidden split remains nil. Refresh failure or deadline expiry clears the affected slots rather than
+  reading the resolver's retained map.
   Strip login `-` before shell recognition; a known shell with only flags is idle and omitted, while
   scripts/payload args remain, including `/bin/sh <script>`.
   System shutdown, restart, and logout skip quit confirmation so `applicationWillTerminate` can capture
@@ -170,10 +188,14 @@ paths:
   Anything else that must cancel an armed replay clears those slots too, never the persisted fields:
   `recoverOrphanedWindows`, `Session.clearPendingRestoreOverrides` on the soft-close round trip, and
   `restore.clear`, which the socket can receive before the later windows' decks have mounted.
+  The pending pair is consumed on the first PERMITTED surface-creation attempt, not at view construction
+  (`LaunchSeedProvider`): while a pane waits on its launch spawn permit the argv and pin stay on the
+  session, so `restore.clear` disarms it and a clean quit re-captures it across that window. The on-demand
+  arm (`restore.capture`) keeps its rerun-only boundary.
   Against STALE files from older builds, `loadStore` also rewrites a snapshot that carried captures on a
   mid-run reopen, and `recoverOrphanedWindows` drops captures while the sticky override still arms
   (a corrupt index must not re-execute a closed window's last command).
-- Restore only when the toggle is on and basename is absent from user
+- Restore captured argv only in `rerun` or a wrapped `live` pane, and only when basename is absent from user
   `restore-denylist.conf`, seeded with `tmux`, `screen`, and `zellij`. A control character anywhere in the
   argv also refuses, matching what `session.restore set` rejects a pin for: the line is typed, so the line
   editor reads the byte before the shell parser and quoting cannot protect it. U+FFFD refuses with it,
@@ -181,10 +203,12 @@ paths:
   RENDER, keeping `hadForeground` true so a stale `initialCommand` stays preempted. A pin loaded from a
   snapshot never passed the dispatcher's check, so `restoreInput` applies it again at the sink; both share
   `CommandRestore.hasControlCharacter`. Feed captured argv once through
-  shell-quoted `config.initial_input` so exit returns to the shell, then nil it. Only one foreground
-  process from a typed pipeline/compound command can be captured.
+  shell-quoted `config.initial_input` in rerun mode, then nil it. A wrapped live pane consumes the pending
+  argv only after configuration succeeds and passes it as a create-only zmx attach payload. An existing
+  daemon ignores the payload; a missing daemon runs it, then starts the final integrated login shell.
+  Fallback never consumes. Only one foreground process from a typed pipeline/compound command can be captured.
 - `session.new --command` persists durable `initialCommand` and restores through shell-replacing
-  `config.command`; fresh creation always runs, restored creation honors the toggle, and captured
+  `config.command`; fresh creation always runs, restored creation honors `rerun`, and captured
   foreground wins. Do not consume `initialCommand`; remove it only when primary exit promotes a split.
   `restore.capture`, `restore.clear` and tree foreground fields are the control surface; the tree fields
   report the live process, not the captured slot, which [[control-api]] keeps read-back-free by design.
@@ -213,9 +237,18 @@ paths:
 - `confirmCloseSession` defaults off and is read on demand, without a mirror. Prompt only for GUI active
   close and sidebar row close; skip under XCUITest. Control `session.close` must never prompt.
 - `hiddenInterfaceElements` stores raw names and preserves unknown values while toggling known ones; empty
-  maps nil. Titlebar cases are `sidebarToggle`, `sessionName`, `windowName`, `recentSessions`, `scratch`,
-  `split`, `dashboard`, `quickTerminal`; sidebar cases are `newWorkspace`, `newSession`, `flaggedView`,
-  `focusFilter`, and row-level `workspaceAddSession`. Attention has its separate default-off setting.
+  maps nil. Titlebar cases are `sidebarToggle`, `workspaceName`, `sessionName`, `windowName`, `remoteHost`,
+  `sessionContext`, `recentSessions`, `scratch`, `split`, `dashboard`, `quickTerminal`, `customCommands`;
+  sidebar cases are `newWorkspace`, `newSession`, `flaggedView`, `focusFilter`, and row-level
+  `workspaceAddSession`.
+  A `hiddenByDefault` case (`workspaceName` and `customCommands`) is governed by `shownInterfaceElements`
+  instead, the same shape with the opposite sense, and its name in the hidden list is ignored. Attention
+  has its separate default-off setting.
+  `workspaceName` leads the identity as `workspace — session — window`, looked up from the ACTIVE SESSION
+  (`workspace(forSession:)`, never `currentWorkspaceID`, which an empty workspace can hold while the old
+  session stays selected). `TitlebarComposition` caps it at `workspaceNameLimit` characters with an
+  ellipsis, display only, because the identity is one tail-truncated text and an uncapped prefix would
+  push the session name off the bar. The OS window title (`WindowTitleSync`) does not carry it.
 - `InterfaceElement` owns section/display name; the tab iterates `allCases`. Mutate the raw set, then push
   resolved known values to `GhosttyApp`. SwiftUI gates with `shows(_:)`; the AppKit row "+" checks the
   mirror on hover. Titlebar group dividers appear only between adjacent groups that each retain at least
@@ -231,5 +264,17 @@ paths:
   settings predate the flag never sees it. Decide it in `agtermApp.init()`: the first launch saves its own
   window within a second of the scene appearing, which would read back as prior state.
   `WelcomeAlert` suppresses itself under XCUITest unless `AGTERM_UITEST_SHOW_WELCOME` is set.
+- `flaggedViewLayout` is a raw `FlaggedViewLayout` (`flat`|`tree`), nil for the default `flat`, resolved by
+  `effectiveFlaggedViewLayout` and mirrored to `GhosttyApp.flaggedViewLayout`. App-wide, never per window.
+  Every sidebar Coordinator picks it up on `.agtermAppearanceChanged`, and only one showing the flagged view
+  rebuilds. The picker sits at the bottom of the General tab's Sessions section: the Interface tab is exactly full at
+  540x680, and one more row pushes the quick-terminal Size off the bottom. A grouped Form scrolls, so an
+  overflowing tab still reports every control hittable; `testFlaggedViewLayoutPickerPersists` compares the
+  tab's last line against the window frame instead.
+  The control catalog carries it as `sidebar.flagged-layout` ([[control-api]]).
+- `htmlOverlayZoom` is the one page zoom every HTML overlay shows at, nil = 1, stepped only by the font
+  commands through `SettingsModel.stepHtmlOverlayZoom`, which saves and mirrors to `HtmlOverlayRegistry`
+  without `persistAndApply`: nothing else renders it, so a keypress must not broadcast an appearance change.
+  No Settings control.
 - These settings are GUI-only unless the control catalog explicitly says otherwise. Do not add settings
   commands merely to mirror chrome; user actions already have control coverage.

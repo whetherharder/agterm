@@ -52,11 +52,12 @@ extension WorkspaceSidebar.Coordinator {
             field.setAccessibilityLabel(workspace?.name ?? "")
             // roll-up badge so an unseen notification stays visible when the workspace is collapsed
             // (gated by the Settings badge toggle, like the session badge below)
-            applyBadge(toCell: cell, count: effectiveUnseen(workspace?.unseenCount ?? 0))
+            applyBadge(toCell: cell, count: effectiveUnseen(workspace.map(displayedUnseen(for:)) ?? 0))
             // a workspace in the focus set draws the SAME grid glyph at BLACK weight, keyed on MEMBERSHIP
             // alone and NOT on `focusEnabled` — so the marked set stays legible with the filter off, while
             // looking at the whole tree.
             cell.imageView?.image = store.focusedWorkspaceIDs.contains(node.id) ? focusedWorkspaceIcon : workspaceIcon
+            cell.imageView?.toolTip = nil
             cell.imageView?.setAccessibilityIdentifier("workspace-icon")
         case .session:
             field.stringValue = rowLabel(forSession: node.id)
@@ -72,8 +73,11 @@ extension WorkspaceSidebar.Coordinator {
             // so the fill would be noise.
             let showSplitIcon = session?.hasSplit == true
             let flagged = store.sidebarMode == .tree && session?.flagged == true
+            let notice = session.flatMap(presentationNotice(for:))
             cell.imageView?.image = iconForSession(split: showSplitIcon, axis: session?.splitAxis ?? .leftRight,
-                                                   flagged: flagged)
+                                                   flagged: flagged, remote: session?.remoteHost != nil,
+                                                   disconnected: notice != nil)
+            cell.imageView?.toolTip = notice
             cell.imageView?.setAccessibilityIdentifier("session-icon")
         }
         // text/icon colors track the terminal theme; a selected row uses the selection foreground.
@@ -86,6 +90,12 @@ extension WorkspaceSidebar.Coordinator {
         return cell
     }
 
+    /// The notice a remote row shows while its presentation stream is not up, nil otherwise.
+    func presentationNotice(for session: Session) -> String? {
+        guard let host = session.remoteHost else { return nil }
+        return session.remotePresentation?.connection.rowNotice(host: host)
+    }
+
     /// Shows the unseen-notification `count` capsule on the row (hidden, zero-width when 0, so the
     /// name reclaims the space). The `notify-badge` accessibility hook lives on `BadgeView`.
     private func applyBadge(toCell cell: SidebarCellView, count: Int) {
@@ -95,7 +105,18 @@ extension WorkspaceSidebar.Coordinator {
 
     /// The leading session-row icon: split-rectangle when split, else plain terminal, each swapped to its
     /// filled variant when `flagged` — tree mode only, the flat flagged view passes `flagged: false`.
-    private func iconForSession(split: Bool, axis: SplitAxis, flagged: Bool) -> NSImage? {
+    ///
+    /// A remote row takes its own glyph and keeps the split bit, not the flagged fill: a HIDDEN split is
+    /// state nothing else reveals, while the fill is tree-mode decoration the flat flagged view already
+    /// passes `flagged: false` for. It marks that split by WEIGHT, as the focused-workspace icon does,
+    /// because `.fill` is what every other row icon spends on FLAGGED, so a filled cloud would read as a
+    /// flag. The axis is not distinguished — no cloud symbol carries both arrangements.
+    ///
+    /// A remote row whose presentation stream is down swaps the cloud for its slashed form.
+    private func iconForSession(split: Bool, axis: SplitAxis, flagged: Bool, remote: Bool,
+                                disconnected: Bool) -> NSImage? {
+        if remote, disconnected { return split ? remoteDisconnectedSplitSessionIcon : remoteDisconnectedSessionIcon }
+        if remote { return split ? remoteSplitSessionIcon : remoteSessionIcon }
         switch (split, axis, flagged) {
         case (true, .topBottom, true): return flaggedHorizontalSplitSessionIcon
         case (true, .topBottom, false): return horizontalSplitSessionIcon
@@ -196,7 +217,7 @@ extension WorkspaceSidebar.Coordinator {
     }
 
     private func makeAddSessionButton() -> NSButton {
-        let btn = NSButton()
+        let btn = AddSessionButton()
         btn.translatesAutoresizingMaskIntoConstraints = false
         btn.isBordered = false
         let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
@@ -222,7 +243,7 @@ extension WorkspaceSidebar.Coordinator {
     /// `rowLabel(for:workspaceName:)`) to stay off the O(n) lookups.
     private func rowLabel(forSession id: UUID) -> String {
         guard let session = store.session(withID: id) else { return "" }
-        let workspaceName = store.sidebarMode == .flagged ? store.workspace(forSession: id)?.name ?? "" : ""
+        let workspaceName = flaggedLayout == .flat ? store.workspace(forSession: id)?.name ?? "" : ""
         return rowLabel(for: session, workspaceName: workspaceName)
     }
 }

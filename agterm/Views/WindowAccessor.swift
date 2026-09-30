@@ -2,31 +2,32 @@ import agtermCore
 import AppKit
 import SwiftUI
 
-/// Blends the window title bar with the terminal (the title text comes from SwiftUI's
-/// `.navigationTitle`/`.navigationSubtitle`): the probe's `window` is nil at make time, so the blend is
-/// applied from `viewDidMoveToWindow` and re-applied on every `titleToken` change (session switch) and the
-/// key/fullscreen transitions where AppKit rebuilds the titlebar subviews. It also carries the per-window
-/// plumbing: persisting/restoring the frame, reporting frontmost (key/main) and close (`willClose`) to the
-/// `WindowLibrary`, and registering the `NSWindow` in `WindowRegistry`.
+/// Blends the window title bar with the terminal: the probe's `window` is nil at make time, so the blend is
+/// applied from `viewDidMoveToWindow` and re-applied on the key/fullscreen transitions where AppKit rebuilds
+/// the titlebar subviews and on appearance changes. A `titleToken` change writes the OS title alone. It also
+/// carries the per-window plumbing: persisting/restoring the frame, reporting frontmost (key/main) and close
+/// (`willClose`) to the `WindowLibrary`, and registering the `NSWindow` in `WindowRegistry`.
 struct WindowAccessor: NSViewRepresentable {
-    /// Changes when the active session changes, so `updateNSView` re-runs the blend.
+    /// The OS window title, written on every change.
     let titleToken: String
     let windowID: WindowInfo.ID
     let library: WindowLibrary
     let store: AppStore
+    let captureOnExit: AppDelegate.ExitCapture?
 
     func makeNSView(context _: Context) -> TitleProbeView {
-        TitleProbeView(windowID: windowID, library: library, store: store)
+        TitleProbeView(windowID: windowID, library: library, store: store, captureOnExit: captureOnExit)
     }
 
     func updateNSView(_ nsView: TitleProbeView, context _: Context) {
-        nsView.reapplyBlend(title: titleToken)
+        nsView.setTitle(titleToken)
     }
 
     final class TitleProbeView: NSView {
         private let windowID: WindowInfo.ID
         private let library: WindowLibrary
         private let store: AppStore
+        private let captureOnExit: AppDelegate.ExitCapture?
 
         /// Observer tokens: AppKit rebuilds the titlebar subviews on key/fullscreen, so the blend re-applies.
         nonisolated(unsafe) private var titlebarObservers: [NSObjectProtocol] = []
@@ -37,10 +38,12 @@ struct WindowAccessor: NSViewRepresentable {
         /// The confirm-before-close delegate proxy, owned here (NSWindow.delegate is weak).
         private var closeProxy: WindowCloseDelegateProxy?
 
-        init(windowID: WindowInfo.ID, library: WindowLibrary, store: AppStore) {
+        init(windowID: WindowInfo.ID, library: WindowLibrary, store: AppStore,
+             captureOnExit: AppDelegate.ExitCapture? = nil) {
             self.windowID = windowID
             self.library = library
             self.store = store
+            self.captureOnExit = captureOnExit
             super.init(frame: .zero)
         }
 
@@ -51,9 +54,12 @@ struct WindowAccessor: NSViewRepresentable {
         /// XCUITest title-matching, but hidden via titleVisibility — the custom header draws the visible one.
         private var latestTitle = ""
 
-        func reapplyBlend(title: String) {
+        /// Writes the title and nothing else: an animated OSC title ticks this many times a second, and the
+        /// blend's other inputs reach `applyTitlebarBlend` through attach and the notifications below (#516).
+        func setTitle(_ title: String) {
             latestTitle = title
-            if let window { applyTitlebarBlend(window) }
+            guard let window, window.title != title else { return }
+            window.title = title
         }
 
         override func viewDidMoveToWindow() {
@@ -129,7 +135,9 @@ struct WindowAccessor: NSViewRepresentable {
             }
             // report close: tear down surfaces, then mark closed. captures library/store/id directly, NOT
             // `self` — the view deallocates as the window closes, so a `[weak self]` hop would no-op.
-            let closeToken = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [library, store, windowID, weak window] _ in
+            let closeToken = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: window, queue: .main
+            ) { [library, store, windowID, captureOnExit, weak window] _ in
                 MainActor.assumeIsolated {
                     // persist the final frame (keyed by its id) so an in-session reopen or a restart restores
                     // size/position; SwiftUI's own index-based autosave can't.
@@ -140,19 +148,19 @@ struct WindowAccessor: NSViewRepresentable {
                     // unregister synchronously on the real AppKit close edge: the registry cancels any pending
                     // pick and retains its result for a poll arriving after the window and store are gone.
                     PickRegistry.shared.unregister(windowID)
+                    store.workspaces.flatMap(\.sessions).forEach { $0.cancelPendingAsk() }
                     store.finalizeAllPendingCloses()
                     // flush cwd drift before dropping the store — AppStore doesn't save on a live `cd`, so a
                     // reopened window would load a stale snapshot. skipped once the window is no longer open:
                     // a delete already dropped the store and removed the per-window file, so this resurrects it.
                     if library.isOpen(windowID) {
-                        // restore-running-command: capture while the surfaces below are still alive. Skipped
+                        // Exit capture runs while the surfaces below are still alive. Skipped
                         // under termination — the quit-time capture already ran, and a re-read assigns
                         // unconditionally, so a foreground that exited since would overwrite it with nil.
                         // `openIDs()` is read before `closeWindow` runs, so it scopes this to the app-exit
                         // close. Contract in `.claude/rules/settings.md`.
-                        if !library.isTerminating, library.openIDs() == [windowID],
-                           GhosttyApp.shared.restoreRunningCommand {
-                            AppDelegate.captureForegroundCommands(sessions: store.workspaces.flatMap(\.sessions))
+                        if !library.isTerminating, library.openIDs() == [windowID], let captureOnExit {
+                            _ = captureOnExit(store.workspaces.flatMap(\.sessions))
                         } else if !library.isTerminating {
                             // a NON-last close must leave no argv in this window's file: a launch restore
                             // cannot tell it from a file open at exit, so the never-windowless reopen fallback
@@ -168,7 +176,7 @@ struct WindowAccessor: NSViewRepresentable {
                     for session in store.workspaces.flatMap(\.sessions) {
                         session.surface?.teardown()
                         session.splitSurface?.teardown()
-                        session.overlaySurface?.teardown()
+                        session.teardownOverlaySlot()
                         session.teardownPaneOverlays()
                         session.scratchSurface?.teardown()
                         session.discardHudBody() // an unrealized HUD has no teardown to delete its body file

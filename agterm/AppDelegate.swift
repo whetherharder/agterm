@@ -1,8 +1,17 @@
 import agtermCore
 import AppKit
+import os
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    typealias ForegroundCommandReader = (GhosttySurfaceView, String?, ZmxForegroundResolver.Snapshot?) -> [String]?
+    typealias ExitCapture = @MainActor @Sendable ([Session]) -> Int
+
+    private static let logger = Logger(subsystem: "com.umputun.agterm", category: "AppDelegate")
+
+    // Leaves 150 ms after the refresh's 350 ms worst case for the per-pane kernel reads.
+    private static let exitCaptureBudget: Duration = .milliseconds(500)
+
     /// App-global window library, set on scene appear; terminate flushes every window's state.
     var library: WindowLibrary?
 
@@ -17,6 +26,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Action hub, set on scene appear so `application(_:open:)` can open a session at an `open -a` path.
     var actions: AppActions?
+
+    /// Injected exit policy; the configured mode is evaluated when the exit happens.
+    var captureOnExit: ExitCapture?
+
+    /// The one-shot marker store for a confirmed Live sessions reset, in the state directory; set on scene
+    /// appear. Nil leaves a pending reset unarmed, and the quit proceeds as an ordinary quit.
+    var liveResetMarkerStore: LiveResetMarkerStore?
+
+    /// Holds the confirmed reset between the dialog or `zmx.reset` and the quit; set on scene appear.
+    var liveReset: LiveResetCoordinator?
 
     /// Strongly retains the current Dock menu's target objects so nil-sender dispatch never depends on
     /// AppKit's target lifetime; replaced whenever the Dock asks for a fresh menu.
@@ -61,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // then re-side the config to the launch appearance, while NSApp exists and no scene has mounted —
         // a dark launch otherwise strips the env, restore replay and command off every restored surface.
         GhosttyApp.shared.syncLaunchColorScheme()
+        HtmlOverlayRegistry.shared.install()
         scheduleRestoredWindowReconciliation(reason: "did-finish-launching")
         NotificationCenter.default.addObserver(self, selector: #selector(menuBeganTracking),
                                                name: NSMenu.didBeginTrackingNotification, object: nil)
@@ -294,21 +314,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_: NSApplication) -> NSApplication.TerminateReply {
         guard !ContentView.isUITestLaunch, let library else { return .terminateNow }
         if QuitReason.isSystemQuit(NSAppleEventManager.shared().currentAppleEvent) { return .terminateNow }
+        if liveReset?.armablePending != nil { return .terminateNow }
         let counts = library.openCounts()
         guard counts.windows > 0 else { return .terminateNow }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Quit Agterm?"
-        alert.informativeText = QuitPrompt.message(windows: counts.windows, sessions: counts.sessions)
+        alert.informativeText = QuitPrompt.message(windows: counts.windows, sessions: counts.sessions,
+                                                   mode: GhosttyApp.shared.restoreLaunchDecision.active)
         alert.addButton(withTitle: "Quit")
         alert.addButton(withTitle: "Cancel")
         return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
     }
 
     func applicationWillTerminate(_: Notification) {
-        // resolve in-memory picker state before closing the socket: a client already polling may observe
+        // resolve in-memory pickers and asks before closing the socket: a client already polling may observe
         // cancellation, but a later poll can still race socket teardown at process exit.
-        actions?.cancelAllPendingPicks()
+        actions?.cancelAllPendingModals()
         controlServer?.stop()
         customCommandRunner?.stop()
         // clear the OS-level Dock badge — it outlives the process while unseenCount is ephemeral, so a quit
@@ -317,18 +339,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // mark terminating so per-window willClose can't zero the open-set during quit — it must survive
         // for the next launch's reopen-all.
         library?.isTerminating = true
-        // restore-running-command: capture each pane's live foreground command BEFORE the snapshot save so a
-        // restored pane can re-run it. A force-quit/crash skips it (sessions + cwd still restore).
-        if settingsModel?.settings.restoreRunningCommand == true, let library {
-            Self.captureForegroundCommands(sessions: library.allOpenSessions())
+        if let library {
+            // flush the stores + index: cwd changes since the last structural mutation aren't auto-persisted.
+            Self.exitFlush(pending: liveReset?.armablePending, steps: ExitFlushSteps(
+                capture: { _ = self.captureOnExit?(library.allOpenSessions()) },
+                finalize: { library.finalizeAllPendingCloses() },
+                saveChecked: { library.saveAllOpenChecked() },
+                save: { library.saveAllOpen() },
+                arm: { selection in
+                    guard let store = self.liveResetMarkerStore else { return false }
+                    return Self.armLiveReset(selection, store: store) {
+                        LiveResetRelauncher().spawn(pid: getpid(), bundle: Bundle.main.bundleURL,
+                                                    stateDirectory: ProcessInfo.processInfo.environment["AGTERM_STATE_DIR"])
+                    }
+                }))
         }
-        library?.finalizeAllPendingCloses()
-        // flush the stores + index: cwd changes since the last structural mutation aren't auto-persisted.
-        library?.saveAllOpen()
         library?.saveIndex()
         // flush pending debounced settings writes (a keyboard-driven opacity/blur change holds a ~0.3s save
         // no drag-end commit fires) so they survive ⌘Q.
         settingsModel?.flushPendingSaves()
+    }
+
+    struct ExitFlushSteps {
+        let capture: () -> Void
+        let finalize: () -> Void
+        let saveChecked: () -> Bool
+        let save: () -> Void
+        let arm: (LiveReset.Selection) -> Bool
+    }
+
+    /// The exit flush in its fixed order: capture, finalize pending closes, then save. A pending Live
+    /// sessions reset takes the CHECKED save and arms only when it reports every snapshot written; capture
+    /// is invoked, not judged, since its count is best effort. Returns whether a reset was armed.
+    @discardableResult
+    static func exitFlush(pending: LiveReset.Selection?, steps: ExitFlushSteps) -> Bool {
+        steps.capture()
+        steps.finalize()
+        guard let pending else {
+            steps.save()
+            return false
+        }
+        guard steps.saveChecked() else {
+            logger.error("live sessions reset not armed: a window snapshot did not save")
+            return false
+        }
+        return steps.arm(pending)
+    }
+
+    /// Writes the marker, then spawns the relauncher; a relauncher that cannot start takes the marker with
+    /// it, so a reset is never armed for a launch nobody triggers.
+    static func armLiveReset(_ selection: LiveReset.Selection, store: LiveResetMarkerStore, spawn: () -> Bool) -> Bool {
+        do {
+            try store.write(LiveReset.Marker(targets: selection.targets))
+        } catch {
+            logger.error("live sessions reset not armed: marker write failed: \(String(describing: error), privacy: .public)")
+            return false
+        }
+        guard spawn() else {
+            store.remove()
+            logger.error("live sessions reset not armed: the relauncher did not start")
+            return false
+        }
+        return true
+    }
+
+    /// Keep the exit policy live so a mode selected after launch governs the next launch.
+    static func makeExitCapture(settingsModel: SettingsModel,
+                                zmxResolver: ZmxForegroundResolver?) -> ExitCapture {
+        return { sessions in
+            guard GhosttyApp.capturesForegroundOnExit(mode: settingsModel.settings.effectiveRestoreMode) else {
+                for session in sessions { session.clearCapturedForegroundCommands() }
+                return 0
+            }
+            return captureForegroundCommands(sessions: sessions, zmxResolver: zmxResolver,
+                                             preserveUnconsumedPending: true)
+        }
     }
 
     /// Capture the given panes' foreground commands (main + split) into their `Session` fields for the
@@ -344,22 +429,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// of a session whose split is hidden or gone still holds whatever an earlier capture put there.
     @MainActor
     @discardableResult
-    static func captureForegroundCommands(sessions: [Session]) -> Int {
+    /// `preserveUnconsumedPending` is EXIT-ONLY. On-demand `restore.capture` must leave an unconsumed slot
+    /// out of the persisted field: persisting it while the pending copy stays armed lets a later show consume
+    /// and replay it, and a crash before the next capture then replays the persisted copy a second time.
+    static func captureForegroundCommands(
+        sessions: [Session], zmxResolver: ZmxForegroundResolver? = nil,
+        preserveUnconsumedPending: Bool = false,
+        timeRemaining suppliedTimeRemaining: (() -> Bool)? = nil,
+        commandReader: ForegroundCommandReader = { view, shell, snapshot in
+            ForegroundProcess.command(for: view, shellBasename: shell, zmxSnapshot: snapshot)
+        }
+    ) -> Int {
+        // filtered here rather than at each caller, so quit and `restore.capture` get the same rule: a
+        // remote pane's foreground is an ssh client the save then drops, and reading it both inflates the
+        // reported count and spends the exit budget on a pane nothing will persist
+        let sessions = sessions.filter(\.isPersistable)
         let shellBasename = ProcessInfo.processInfo.environment["SHELL"].map(CommandRestore.basename)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: exitCaptureBudget)
+        let timeRemaining = suppliedTimeRemaining ?? { clock.now < deadline }
+        let hasWrappedPane = sessions.contains { session in
+            session.surface?.backedByZmx == true || session.splitSurface?.backedByZmx == true
+        }
+        let zmxSnapshot = hasWrappedPane
+            ? zmxResolver?.freshSnapshot(timeout: ZmxClient.captureInvocationTimeout)
+            : nil
         var captured = 0
+        // `loadStore` moves the persisted argv into the pending slot and rewrites the file with nil, so this
+        // is the only thing that refills it: at exit, writing nil over a slot NO factory consumed destroys
+        // it. That happens on a fallback launch and on a restored hidden split never shown.
         for session in sessions {
+            let pending = preserveUnconsumedPending ? session.pendingForegroundCommand : nil
+            let pendingSplit = preserveUnconsumedPending ? session.pendingSplitForegroundCommand : nil
             if let view = session.surface as? GhosttySurfaceView {
-                session.foregroundCommand = ForegroundProcess.command(for: view, shellBasename: shellBasename)
-                if session.foregroundCommand != nil { captured += 1 }
-            }
-            // only a SHOWN split is recreated on restore, so gate on isSplit — a hidden split's captured
-            // command would sit stale until the next ⌘D fires it. Clearing it in the else keeps that stale
-            // value out of the snapshot now that a capture can run more than once per launch.
-            if session.isSplit, let split = session.splitSurface as? GhosttySurfaceView {
-                session.splitForegroundCommand = ForegroundProcess.command(for: split, shellBasename: shellBasename)
-                if session.splitForegroundCommand != nil { captured += 1 }
+                let read = timeRemaining() && (!view.backedByZmx || zmxSnapshot != nil)
+                    ? commandReader(view, shellBasename, zmxSnapshot) : nil
+                if read != nil { captured += 1 }
+                session.foregroundCommand = read ?? pending
             } else {
-                session.splitForegroundCommand = nil
+                session.foregroundCommand = pending
+            }
+            if let split = session.splitSurface as? GhosttySurfaceView,
+               session.isSplit || split.backedByZmx {
+                let read = timeRemaining() && (!split.backedByZmx || zmxSnapshot != nil)
+                    ? commandReader(split, shellBasename, zmxSnapshot) : nil
+                if read != nil { captured += 1 }
+                session.splitForegroundCommand = read ?? pendingSplit
+            } else {
+                session.splitForegroundCommand = pendingSplit
             }
         }
         return captured

@@ -615,382 +615,6 @@ struct ControlDispatcherTests {
         #expect(actions.calls == [.workspaceNew(window: "win", "api", collapsed: true)])
     }
 
-    @Test func sessionFlagRoutesModeForHostSideValidation() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        let flagged = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionFlag,
-            target: "session",
-            args: ControlArgs(mode: "on", window: "win")
-        ))
-        let cleared = await dispatcher.dispatch(ControlRequest(cmd: .sessionFlag, args: ControlArgs(mode: "clear")))
-
-        #expect(flagged == ControlResponse(ok: true))
-        #expect(cleared == ControlResponse(ok: true))
-        #expect(actions.calls == [
-            .sessionFlag(target: "session", window: "win", "on"),
-            .sessionFlag(target: nil, window: nil, "clear")
-        ])
-    }
-
-    @Test func sessionSeenRoutesTargetAndWindow() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        let seen = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionSeen,
-            target: "session",
-            args: ControlArgs(window: "win")
-        ))
-        let active = await dispatcher.dispatch(ControlRequest(cmd: .sessionSeen))
-
-        #expect(seen == ControlResponse(ok: true))
-        #expect(active == ControlResponse(ok: true))
-        #expect(actions.calls == [
-            .markSessionSeen(target: "session", window: "win"),
-            .markSessionSeen(target: nil, window: nil)
-        ])
-    }
-
-    @Test func sessionStatusRoutesParsedStatusAndRejectsInvalidStatus() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        let status = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionStatus,
-            target: "session",
-            args: ControlArgs(window: "win", status: "blocked", blink: true,
-                              autoReset: true, sound: "default", color: "#ff0000")
-        ))
-        let bad = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionStatus,
-            target: "session",
-            args: ControlArgs(status: "bogus")
-        ))
-        let badColor = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionStatus,
-            target: "session",
-            args: ControlArgs(status: "blocked", color: "nope")
-        ))
-
-        #expect(status == ControlResponse(ok: true))
-        #expect(bad == ControlResponse(ok: false, error: "invalid status"))
-        #expect(badColor == ControlResponse(ok: false, error: "invalid color (expected #rrggbb)"))
-        #expect(actions.calls == [
-            .sessionStatus(target: "session", window: "win",
-                           ControlSessionStatusUpdate(status: .blocked, blink: true,
-                                                      autoReset: true, sound: "default", color: "#ff0000", pane: nil))
-        ])
-    }
-
-    @Test func sessionStatusRevertsColorWhenOmitted() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        // the second update must carry color nil: the app arm builds a fresh AgentIndicator from
-        // update.color, so a call without --color clears the tint.
-        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionStatus, target: "session",
-                                                     args: ControlArgs(status: "blocked", color: "#ff0000")))
-        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionStatus, target: "session",
-                                                     args: ControlArgs(status: "blocked")))
-
-        #expect(actions.calls == [
-            .sessionStatus(target: "session", window: nil,
-                           ControlSessionStatusUpdate(status: .blocked, blink: nil, autoReset: nil,
-                                                      sound: nil, color: "#ff0000")),
-            .sessionStatus(target: "session", window: nil,
-                           ControlSessionStatusUpdate(status: .blocked, blink: nil, autoReset: nil,
-                                                      sound: nil, color: nil))
-        ])
-    }
-
-    @Test func sessionStatusCarriesValidPaneAndRejectsInvalidPane() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        // the opaque --pane-id rides through untouched alongside a valid role --pane (the app-side arm, not
-        // the dispatcher, resolves the token against the session's live surfaces).
-        let tagged = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionStatus,
-            target: "session",
-            args: ControlArgs(pane: "right", paneID: "agent-tok", status: "blocked")
-        ))
-        let badPane = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionStatus,
-            target: "session",
-            args: ControlArgs(pane: "middle", status: "blocked")
-        ))
-
-        #expect(tagged == ControlResponse(ok: true))
-        #expect(badPane == ControlResponse(ok: false, error: "--pane must be left, right, or scratch"))
-        #expect(actions.calls == [
-            .sessionStatus(target: "session", window: nil,
-                           ControlSessionStatusUpdate(status: .blocked, blink: nil, autoReset: nil,
-                                                      sound: nil, pane: .right, paneID: "agent-tok"))
-        ])
-    }
-
-    @Test(arguments: StatusShape.allCases)
-    func sessionStatusCarriesEveryValidShape(_ shape: StatusShape) async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        let response = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionStatus,
-            target: "session",
-            args: ControlArgs(status: "blocked", shape: shape.rawValue)
-        ))
-
-        #expect(response == ControlResponse(ok: true))
-        #expect(actions.calls == [
-            .sessionStatus(target: "session", window: nil,
-                           ControlSessionStatusUpdate(status: .blocked, blink: nil, autoReset: nil,
-                                                      sound: nil, shape: shape))
-        ])
-    }
-
-    @Test func sessionStatusForwardsShapeOnlyWhenTheArgIsPresent() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        // present → the parsed shape, absent → nil. The user-facing "next call without --shape discards
-        // it" contract is the store's (AppStoreTests.controlTreeDropsStatusShapeOnTheNextSetWithoutOne).
-        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionStatus, target: "session",
-                                                     args: ControlArgs(status: "blocked", shape: "triangle")))
-        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionStatus, target: "session",
-                                                     args: ControlArgs(status: "blocked")))
-
-        #expect(actions.calls == [
-            .sessionStatus(target: "session", window: nil,
-                           ControlSessionStatusUpdate(status: .blocked, blink: nil, autoReset: nil,
-                                                      sound: nil, shape: .triangle)),
-            .sessionStatus(target: "session", window: nil,
-                           ControlSessionStatusUpdate(status: .blocked, blink: nil, autoReset: nil,
-                                                      sound: nil, shape: nil))
-        ])
-    }
-
-    @Test func sessionStatusRejectsInvalidShapeWithoutMutating() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        let response = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionStatus,
-            target: "session",
-            args: ControlArgs(status: "blocked", shape: "hexagon")
-        ))
-
-        // the accepted set in the message is derived from allCases, so it tracks the enum.
-        let accepted = StatusShape.allCases.map(\.rawValue).joined(separator: "|")
-        #expect(response == ControlResponse(ok: false, error: "invalid shape: hexagon (\(accepted))"))
-        #expect(actions.calls.isEmpty)
-    }
-
-    @Test func sessionStatusAcceptsShapeOnIdle() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        // idle renders no glyph, so a shape is accepted and simply carries nothing to draw — same as --color.
-        let response = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionStatus,
-            target: "session",
-            args: ControlArgs(status: "idle", shape: "star")
-        ))
-
-        #expect(response == ControlResponse(ok: true))
-        #expect(actions.calls == [
-            .sessionStatus(target: "session", window: nil,
-                           ControlSessionStatusUpdate(status: .idle, blink: nil, autoReset: nil,
-                                                      sound: nil, shape: .star))
-        ])
-    }
-
-    @Test func sessionStatusColorErrorWinsOverInvalidPane() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        let response = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionStatus,
-            target: "session",
-            args: ControlArgs(pane: "middle", status: "blocked", color: "nope")
-        ))
-
-        #expect(response == ControlResponse(ok: false, error: "invalid color (expected #rrggbb)"))
-        #expect(actions.calls.isEmpty)
-    }
-
-    @Test func sessionStatusValidatesColorThenShapeThenPane() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-        let accepted = StatusShape.allCases.map(\.rawValue).joined(separator: "|")
-
-        // pin both boundaries, so reordering the three guards cannot change which error a caller sees
-        // without failing here.
-        let colorOverShape = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionStatus, target: "session",
-            args: ControlArgs(status: "blocked", color: "nope", shape: "hexagon")
-        ))
-        let shapeOverPane = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionStatus, target: "session",
-            args: ControlArgs(pane: "middle", status: "blocked", shape: "hexagon")
-        ))
-
-        #expect(colorOverShape == ControlResponse(ok: false, error: "invalid color (expected #rrggbb)"))
-        #expect(shapeOverPane == ControlResponse(ok: false, error: "invalid shape: hexagon (\(accepted))"))
-        #expect(actions.calls.isEmpty)
-    }
-
-    @Test func sessionRestoreRoutesEachModeToTheHost() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-        actions.nextSessionRestoreResponse = ControlResponse(ok: true, result: ControlResult(id: "session"))
-
-        let set = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionRestore, target: "session",
-            args: ControlArgs(mode: "set", command: "claude --resume abc", window: "win")
-        ))
-        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionRestore, target: "session",
-                                                     args: ControlArgs(mode: "none")))
-        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionRestore, target: "session",
-                                                     args: ControlArgs(mode: "clear")))
-
-        #expect(set == ControlResponse(ok: true, result: ControlResult(id: "session")))
-        #expect(actions.calls == [
-            .sessionRestore(target: "session", window: "win",
-                            ControlSessionRestoreUpdate(pin: .pin("claude --resume abc"))),
-            .sessionRestore(target: "session", window: nil, ControlSessionRestoreUpdate(pin: .pinNone)),
-            .sessionRestore(target: "session", window: nil, ControlSessionRestoreUpdate(pin: .unpin))
-        ])
-    }
-
-    @Test func sessionRestoreCarriesPaneAndPaneIDThrough() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        let response = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionRestore, target: "session",
-            args: ControlArgs(mode: "set", command: "htop", pane: "right", paneID: "pane-tok")
-        ))
-
-        #expect(response == ControlResponse(ok: true))
-        #expect(actions.calls == [
-            .sessionRestore(target: "session", window: nil,
-                            ControlSessionRestoreUpdate(pin: .pin("htop"), pane: .right, paneID: "pane-tok"))
-        ])
-    }
-
-    @Test func sessionRestoreKeepsShellMetacharactersVerbatim() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        // a pinned value is a SHELL LINE: operators, quotes, and variables are the point and must reach
-        // the host unmodified (never re-quoted).
-        let line = "cd \"$HOME/dev\" && claude --resume abc | tee /tmp/x; echo done"
-        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionRestore, target: "session",
-                                                     args: ControlArgs(mode: "set", command: line)))
-
-        #expect(actions.calls == [
-            .sessionRestore(target: "session", window: nil, ControlSessionRestoreUpdate(pin: .pin(line)))
-        ])
-    }
-
-    @Test func sessionRestoreRejectsBadModeAndMissingCommand() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        let unknown = await dispatcher.dispatch(ControlRequest(cmd: .sessionRestore, target: "session",
-                                                               args: ControlArgs(mode: "pin")))
-        let missingMode = await dispatcher.dispatch(ControlRequest(cmd: .sessionRestore, target: "session"))
-        let noCommand = await dispatcher.dispatch(ControlRequest(cmd: .sessionRestore, target: "session",
-                                                                  args: ControlArgs(mode: "set")))
-
-        #expect(unknown == ControlResponse(ok: false, error: "invalid restore mode: pin (set|none|clear)"))
-        #expect(missingMode == ControlResponse(ok: false, error: "invalid restore mode:  (set|none|clear)"))
-        #expect(noCommand == ControlResponse(ok: false, error: "session.restore set requires a command"))
-        #expect(actions.calls.isEmpty)
-    }
-
-    @Test func sessionRestoreSetWithAnEmptyCommandPinsNothing() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        // an empty command is the tri-state's "pinned to nothing" — the same state `none` writes — so it
-        // reaches the host as `.pin("")` and `agtermctl session restore ""` agrees with `--none`.
-        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionRestore, target: "session",
-                                                     args: ControlArgs(mode: "set", command: "")))
-
-        #expect(actions.calls == [
-            .sessionRestore(target: "session", window: nil, ControlSessionRestoreUpdate(pin: .pin("")))
-        ])
-    }
-
-    @Test func sessionRestoreRejectsControlCharactersAndBadPane() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        let newline = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionRestore, target: "session",
-            args: ControlArgs(mode: "set", command: "echo one\necho two")
-        ))
-        let tab = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionRestore, target: "session",
-            args: ControlArgs(mode: "set", command: "echo\tone")
-        ))
-        let badPane = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionRestore, target: "session",
-            args: ControlArgs(mode: "set", command: "htop", pane: "middle")
-        ))
-
-        // the message names the whole control-character class, so a tab rejection is not called multi-line.
-        #expect(newline == ControlResponse(ok: false, error: "command must not contain control characters"))
-        #expect(tab == ControlResponse(ok: false, error: "command must not contain control characters"))
-        #expect(badPane == ControlResponse(ok: false, error: "--pane must be left, right, or scratch"))
-        #expect(actions.calls.isEmpty)
-    }
-
-    @Test func sessionRestoreRejectsInvalidPaneOnNonSetModes() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-
-        let none = await dispatcher.dispatch(ControlRequest(cmd: .sessionRestore, target: "session",
-                                                             args: ControlArgs(mode: "none", pane: "middle")))
-        let clear = await dispatcher.dispatch(ControlRequest(cmd: .sessionRestore, target: "session",
-                                                              args: ControlArgs(mode: "clear", pane: "middle")))
-
-        #expect(none == ControlResponse(ok: false, error: "--pane must be left, right, or scratch"))
-        #expect(clear == ControlResponse(ok: false, error: "--pane must be left, right, or scratch"))
-        #expect(actions.calls.isEmpty)
-    }
-
-    @Test func sessionRestoreCapsCommandAtByteLimitNotGraphemeCount() async {
-        let actions = MockControlActions()
-        let dispatcher = ControlDispatcher(actions: actions)
-        let cap = ControlRestoreOverride.maxCommandBytes
-
-        let exact = String(repeating: "a", count: cap)
-        let over = String(repeating: "a", count: cap + 1)
-        // 400 four-byte scalars = 1600 UTF-8 bytes but only 400 characters: under the cap by grapheme
-        // count, over it by BYTES — the cap is a storage bound, so this must be rejected.
-        let multiByte = String(repeating: "🌍", count: 400)
-
-        let exactResponse = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionRestore, target: "session", args: ControlArgs(mode: "set", command: exact)))
-        let overResponse = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionRestore, target: "session", args: ControlArgs(mode: "set", command: over)))
-        let multiByteResponse = await dispatcher.dispatch(ControlRequest(
-            cmd: .sessionRestore, target: "session", args: ControlArgs(mode: "set", command: multiByte)))
-
-        #expect(multiByte.count < cap)
-        #expect(multiByte.utf8.count > cap)
-        #expect(exactResponse == ControlResponse(ok: true))
-        #expect(overResponse == ControlResponse(ok: false, error: "command too long (max \(cap) bytes)"))
-        #expect(multiByteResponse == ControlResponse(ok: false, error: "command too long (max \(cap) bytes)"))
-        #expect(actions.calls == [
-            .sessionRestore(target: "session", window: nil, ControlSessionRestoreUpdate(pin: .pin(exact)))
-        ])
-    }
-
     @Test func splitScratchFocusAndResizeRouteParsedInputs() async {
         let actions = MockControlActions()
         let dispatcher = ControlDispatcher(actions: actions)
@@ -1033,6 +657,43 @@ struct ControlDispatcherTests {
             .sessionFocus(target: "session", window: nil, "right"),
             .sessionResize(target: "session", window: "win", .delta(-0.1))
         ])
+    }
+
+    @Test func sessionSwapRoutesTargetAndWindow() async {
+        let actions = MockControlActions()
+        actions.nextSessionSwapResponse = ControlResponse(ok: true, result: ControlResult(id: "session-id"))
+
+        let response = await ControlDispatcher(actions: actions).dispatch(ControlRequest(
+            cmd: .sessionSwap,
+            target: "session",
+            args: ControlArgs(window: "win")
+        ))
+
+        #expect(response == ControlResponse(ok: true, result: ControlResult(id: "session-id")))
+        #expect(actions.calls == [.sessionSwap(target: "session", window: "win")])
+    }
+
+    @Test func sessionLeadParsesThePaneOnceAndRoutesIt() async {
+        let actions = MockControlActions()
+
+        let response = await ControlDispatcher(actions: actions).dispatch(ControlRequest(
+            cmd: .sessionLead, target: "session", args: ControlArgs(window: "win", pane: "split")))
+        let bare = await ControlDispatcher(actions: actions).dispatch(ControlRequest(cmd: .sessionLead, target: "active"))
+
+        #expect(response?.ok == true)
+        #expect(bare?.ok == true)
+        #expect(actions.calls == [.sessionLead(target: "session", window: "win", pane: .right),
+                                  .sessionLead(target: "active", window: nil, pane: nil)])
+    }
+
+    @Test func sessionLeadRejectsAnUnknownPaneBeforeDispatch() async {
+        let actions = MockControlActions()
+
+        let response = await ControlDispatcher(actions: actions).dispatch(ControlRequest(
+            cmd: .sessionLead, target: "session", args: ControlArgs(pane: "middle")))
+
+        #expect(response == ControlResponse(ok: false, error: "invalid pane: middle"))
+        #expect(actions.calls.isEmpty)
     }
 
     @Test func splitRejectsAnUnknownAxisBeforeDispatch() async {
@@ -1101,10 +762,74 @@ struct ControlDispatcherTests {
                                                      args: ControlArgs(pane: "left")))
 
         #expect(actions.calls == [
-            .font(target: "session", window: nil, pane: "right", "decrease_font_size:1"),
-            .font(target: "session", window: "win", pane: "scratch", "increase_font_size:1"),
-            .font(target: "session", window: nil, pane: "left", "reset_font_size")
+            .font(target: "session", window: nil, pane: .right, "decrease_font_size:1"),
+            .font(target: "session", window: "win", pane: .scratch, "increase_font_size:1"),
+            .font(target: "session", window: nil, pane: .left, "reset_font_size")
         ])
+    }
+
+    // `validatePaneArgument` has always accepted the role and position aliases, but the app matched raw
+    // spellings, so `--pane split` validated on the client and then failed on the server. The parse lives in
+    // the dispatcher now, and these are the spellings it has to canonicalize for every pane-taking command.
+    @Test func paneTakingCommandsCanonicalizeTheAliases() async {
+        let aliases: [(String, StatusPane)] = [("left", .left), ("primary", .left), ("top", .left),
+                                               ("right", .right), ("split", .right), ("bottom", .right),
+                                               ("scratch", .scratch)]
+        for (spelling, expected) in aliases {
+            let actions = MockControlActions()
+            let dispatcher = ControlDispatcher(actions: actions)
+
+            _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionType, target: "s",
+                                                         args: ControlArgs(text: "x", pane: spelling)))
+            _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionText, target: "s",
+                                                         args: ControlArgs(pane: spelling)))
+            _ = await dispatcher.dispatch(ControlRequest(cmd: .fontInc, target: "s",
+                                                         args: ControlArgs(pane: spelling)))
+
+            #expect(actions.calls == [
+                .sessionType(target: "s", window: nil,
+                             ControlSessionTypeOptions(text: "x", select: false, pane: expected)),
+                .sessionText(target: "s", window: nil,
+                             ControlSessionTextOptions(pane: expected, all: false, lines: nil)),
+                .font(target: "s", window: nil, pane: expected, "increase_font_size:1")
+            ], "--pane \(spelling) must resolve to \(expected) on every command that takes it")
+        }
+    }
+
+    // a raw socket client runs no `validate()`, so the rejection is the dispatcher's. Parsing the value moved
+    // there, but the wording these three have answered since they shipped did not, so it stays
+    // `invalid pane: <value>` rather than `session.status`'s pinned string. The action must not be reached.
+    @Test func paneTakingCommandsRejectAnUnknownPaneWithoutCallingTheAction() async {
+        let requests: [ControlRequest] = [
+            ControlRequest(cmd: .sessionType, target: "s", args: ControlArgs(text: "x", pane: "middle")),
+            ControlRequest(cmd: .sessionText, target: "s", args: ControlArgs(pane: "middle")),
+            ControlRequest(cmd: .fontInc, target: "s", args: ControlArgs(pane: "middle")),
+            ControlRequest(cmd: .fontDec, target: "s", args: ControlArgs(pane: "middle")),
+            ControlRequest(cmd: .fontReset, target: "s", args: ControlArgs(pane: "middle"))
+        ]
+        for request in requests {
+            let actions = MockControlActions()
+            let dispatcher = ControlDispatcher(actions: actions)
+
+            let response = await dispatcher.dispatch(request)
+
+            #expect(response == ControlResponse(ok: false, error: "invalid pane: middle"),
+                    "\(request.cmd.rawValue) must answer its own pane rejection")
+            #expect(actions.calls.isEmpty, "\(request.cmd.rawValue) must not reach the action")
+        }
+    }
+
+    // the extent is parsed before the pane, so adding a pane error to an already-bad extent must not change
+    // which error a caller sees first. `session.overlay.text` pins the same order.
+    @Test func sessionTextReportsAnExtentErrorBeforeAPaneOne() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionText, target: "s", args: ControlArgs(pane: "middle", all: true, lines: 5)))
+
+        #expect(response == ControlResponse(ok: false, error: "use either --all or --lines, not both"))
+        #expect(actions.calls.isEmpty)
     }
 
     @Test func keymapAndConfigReloadWrapDiagnosticCounts() async {
@@ -1146,6 +871,39 @@ struct ControlDispatcherTests {
 
         #expect(response?.ok == true)
         #expect(actions.calls == [.keymapList])
+    }
+
+    @Test func hooksReloadAndListRouteToActionsAndKeepPayloads() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        let payload = ControlHooks(path: "/tmp/hooks.conf", diagnostics: [],
+                                   hooks: [ControlHookEntry(kind: "status", command: "~/s.sh", line: 1)])
+        actions.nextHooksReloadResponse = ControlResponse(ok: true, result: ControlResult(count: 1))
+        actions.nextHooksListResponse = ControlResponse(ok: true, result: ControlResult(hooks: payload))
+
+        let reload = await dispatcher.dispatch(ControlRequest(cmd: .hooksReload))
+        let list = await dispatcher.dispatch(ControlRequest(cmd: .hooksList))
+
+        #expect(reload == ControlResponse(ok: true, result: ControlResult(count: 1)))
+        #expect(list == ControlResponse(ok: true, result: ControlResult(hooks: payload)))
+        #expect(actions.calls == [.hooksReload, .hooksList])
+    }
+
+    @Test func hooksCommandsRefuseATargetOrWindowBeforeAnyAction() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let targeted = await dispatcher.dispatch(ControlRequest(cmd: .hooksReload, target: "active"))
+        let windowed = await dispatcher.dispatch(ControlRequest(cmd: .hooksList, args: ControlArgs(window: "w1")))
+
+        #expect(targeted == ControlResponse(ok: false, error: "hooks.reload takes no target or --window"))
+        #expect(windowed == ControlResponse(ok: false, error: "hooks.list takes no target or --window"))
+        #expect(actions.calls.isEmpty)
+    }
+
+    @Test func unsupportedMessageNamesTheHooksCommand() {
+        #expect(ControlActionsUnsupported.message("hooks.reload") == "hooks.reload is not supported on this platform")
+        #expect(ControlActionsUnsupported.message("hooks.list") == "hooks.list is not supported on this platform")
     }
 
     @Test func versionRoutesToActionsAndKeepsTheIdentity() async {
@@ -1288,7 +1046,7 @@ struct ControlDispatcherTests {
         #expect(response == ControlResponse(ok: false, error: "session not realized"))
         #expect(actions.calls == [
             .sessionType(target: "session", window: "win",
-                         ControlSessionTypeOptions(text: "ls\n", select: true, pane: "scratch"))
+                         ControlSessionTypeOptions(text: "ls\n", select: true, pane: .scratch))
         ])
     }
 
@@ -1327,7 +1085,51 @@ struct ControlDispatcherTests {
             cmd: .sessionPaste, target: "session", args: ControlArgs(window: "win")))
 
         #expect(response == ControlResponse(ok: true, result: ControlResult(id: "session")))
-        #expect(actions.calls == [.sessionPaste(target: "session", window: "win")])
+        #expect(actions.calls == [.sessionPaste(target: "session", window: "win", pane: nil)])
+    }
+
+    // an omitted `pane` must stay nil rather than becoming a default: the action reads nil as the main pane
+    // through `addressableSurface`, which is what every pre-`--pane` caller got.
+    @Test func sessionPasteRoutesPane() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        actions.nextSessionPasteResponse = ControlResponse(ok: true, result: ControlResult(id: "session"))
+
+        let response = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionPaste, target: "session", args: ControlArgs(pane: "right")))
+
+        #expect(response == ControlResponse(ok: true, result: ControlResult(id: "session")))
+        #expect(actions.calls == [.sessionPaste(target: "session", window: nil, pane: .right)])
+    }
+
+    // the aliases the CLI's `validate()` accepts have to reach the surface, so the pane is parsed HERE rather
+    // than matched as a spelling in the app: `session paste --pane split` used to validate and then fail.
+    @Test func sessionPasteAcceptsThePaneAliases() async {
+        for (spelling, expected) in [("primary", StatusPane.left), ("top", .left),
+                                     ("split", .right), ("bottom", .right), ("scratch", .scratch)] {
+            let actions = MockControlActions()
+            let dispatcher = ControlDispatcher(actions: actions)
+            actions.nextSessionPasteResponse = ControlResponse(ok: true, result: ControlResult(id: "session"))
+
+            _ = await dispatcher.dispatch(ControlRequest(
+                cmd: .sessionPaste, target: "session", args: ControlArgs(pane: spelling)))
+
+            #expect(actions.calls == [.sessionPaste(target: "session", window: nil, pane: expected)],
+                    "--pane \(spelling) must resolve to \(expected)")
+        }
+    }
+
+    // a raw socket client runs no `validate()`, so the rejection is the dispatcher's, and it is the same
+    // pinned string the CLI throws. The action must not be reached.
+    @Test func sessionPasteRejectsAnUnknownPaneWithoutCallingTheAction() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionPaste, target: "session", args: ControlArgs(pane: "other")))
+
+        #expect(response == ControlResponse(ok: false, error: "--pane must be left, right, or scratch"))
+        #expect(actions.calls.isEmpty)
     }
 
     @Test func sessionSelectAllRoutesTargetAndWindow() async {
@@ -1385,6 +1187,30 @@ struct ControlDispatcherTests {
             .sessionBackground(target: "session", window: nil,
                                ControlSessionBackgroundOptions(watermark: nil))
         ])
+    }
+
+    @Test(arguments: [("left", StatusPane.left), ("split", .right), ("bottom", .right), ("scratch", .scratch)])
+    func sessionBackgroundPassesTheParsedPane(raw: String, pane: StatusPane) async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        actions.nextSessionBackgroundResponse = ControlResponse(ok: true, result: ControlResult(id: "session"))
+
+        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionBackground, target: "session",
+                                                     args: ControlArgs(mode: "clear", pane: raw)))
+
+        #expect(actions.calls == [.sessionBackground(target: "session", window: nil,
+                                                     ControlSessionBackgroundOptions(watermark: nil, pane: pane))])
+    }
+
+    @Test func sessionBackgroundRejectsAnUnknownPaneBeforeCallingActions() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionBackground, args: ControlArgs(mode: "color", pane: "middle", color: "#102030")))
+
+        #expect(response == ControlResponse(ok: false, error: "--pane must be left, right, or scratch"))
+        #expect(actions.calls.isEmpty)
     }
 
     @Test func sessionBackgroundRejectsInvalidInputsBeforeCallingActions() async {
@@ -1465,13 +1291,14 @@ struct ControlDispatcherTests {
         let response = await dispatcher.dispatch(ControlRequest(
             cmd: .sessionText,
             target: "session",
-            args: ControlArgs(window: "win", pane: "scratch", lines: 10)
+            args: ControlArgs(window: "win", pane: "scratch", paneID: "stable-token", lines: 10)
         ))
 
         #expect(response == ControlResponse(ok: true, result: ControlResult(text: "line\n")))
         #expect(actions.calls == [
             .sessionText(target: "session", window: "win",
-                         ControlSessionTextOptions(pane: "scratch", all: false, lines: 10))
+                         ControlSessionTextOptions(pane: .scratch, paneID: "stable-token",
+                                                   all: false, lines: 10))
         ])
     }
 
@@ -1831,6 +1658,40 @@ struct ControlDispatcherTests {
             .windowClose(target: "win-b"),
             .windowDelete(target: "win-b")
         ])
+    }
+
+    @Test func windowGoRoutesBothDirectionsThroughActions() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        actions.nextWindowGoResponse = ControlResponse(ok: true, result: ControlResult(id: "win-b"))
+
+        let next = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(to: "next")))
+        let prev = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(to: "prev")))
+        let spelled = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(to: "previous")))
+
+        #expect(next == ControlResponse(ok: true, result: ControlResult(id: "win-b")))
+        #expect(prev == next)
+        #expect(spelled == next)
+        #expect(actions.calls == [.windowGo(.next), .windowGo(.previous), .windowGo(.previous)])
+    }
+
+    @Test func windowGoIgnoresAWindowArgumentAndRejectsABadDirection() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        // app-global: there is no per-window scope to carry, so `--window` cannot narrow the step
+        let scoped = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(window: "win", to: "next")))
+        #expect(actions.calls == [.windowGo(.next)])
+
+        let missing = await dispatcher.dispatch(ControlRequest(cmd: .windowGo))
+        let unknown = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(to: "sideways")))
+        let sessionOnly = await dispatcher.dispatch(ControlRequest(cmd: .windowGo, args: ControlArgs(to: "first")))
+
+        #expect(scoped == ControlResponse(ok: true))
+        #expect(missing == ControlResponse(ok: false, error: "window.go requires --to next|prev"))
+        #expect(unknown == missing)
+        #expect(sessionOnly == missing)
+        #expect(actions.calls == [.windowGo(.next)])
     }
 
     @Test func windowCommandsRouteParsedInputsAndKeepActionResponses() async {

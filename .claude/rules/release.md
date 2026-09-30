@@ -14,6 +14,8 @@ paths:
   The image itself comes from `scripts/dmg.sh`, shared with `universal-build.yml`; only signing,
   notarizing and stapling it stay here, where the identity is.
   Without `--publish`, the full build/sign/notarize/staple/`spctl` dry-run stops before upload.
+- Developer ID signing is inside-out: `agtermctl`, zmx and `agterm-session-host` are signed first with no
+  entitlements, then the app is sealed with its TCC entitlements. The script rejects any helper carrying them.
 - Before writing or committing a release section, put the exact `CHANGELOG.md` text in a temp file and
   pass it through the `draft-approval` skill's `draft-review.sh`; address annotations and get explicit
   chat approval. `release.sh:70-85` publishes that text as the GitHub release body.

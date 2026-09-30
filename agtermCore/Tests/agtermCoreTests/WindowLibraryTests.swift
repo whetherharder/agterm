@@ -7,6 +7,61 @@ import Testing
 /// `WindowLibrary` is `@MainActor`, so the suite is too.
 @MainActor
 final class WindowLibraryTests {
+    @Test(arguments: [false, true])
+    func droppingAWindowCancelsAllItsSessionAsks(remove: Bool) throws {
+        let library = WindowLibrary(directory: directory)
+        let remainingID = try #require(library.activeWindowID)
+        let remainingSession = try #require(library.activeStore?.activeSession)
+        let closing = library.newWindow(name: "closing")
+        let store = try #require(library.store(for: closing.id))
+        let workspace = store.addWorkspace(name: "second workspace")
+        _ = store.addSession(toWorkspace: workspace.id, cwd: "/tmp")
+        let sessions = store.workspaces.flatMap(\.sessions) + [remainingSession]
+        let registry = AskRegistry.shared
+        let asks = sessions.map { session in
+            let ask = PendingAsk(id: UUID().uuidString, title: "Continue?", buttons: [ControlAskButton(id: "yes", label: "Yes")])
+            let windowID = session === remainingSession ? remainingID : closing.id
+            #expect(session.openAsk(ask))
+            #expect(registry.register(id: ask.id, owner: .session(session.id, window: windowID)))
+            return ask
+        }
+        defer { for (session, ask) in zip(sessions, asks) { session.cancelAsk(id: ask.id) } }
+
+        if remove { library.removeWindow(closing.id) } else { library.closeWindow(closing.id) }
+
+        #expect(library.store(for: closing.id) == nil)
+        for (session, ask) in zip(sessions.dropLast(), asks.dropLast()) {
+            #expect(session.askPending == nil)
+            #expect(registry.owner(for: ask.id) == nil)
+            #expect(registry.result(for: ask.id)?.result == ControlAskResult(result: .cancelled))
+            #expect(registry.result(for: ask.id)?.windowID == closing.id)
+        }
+        #expect(remainingSession.askPending == asks.last)
+        #expect(library.store(for: remainingID) != nil)
+    }
+
+    @Test(arguments: [false, true])
+    func windowRemovalNoOpsKeepTheSessionAsk(terminating: Bool) throws {
+        let library = WindowLibrary(directory: directory)
+        let windowID = try #require(library.activeWindowID)
+        let session = try #require(library.activeStore?.activeSession)
+        let ask = PendingAsk(id: UUID().uuidString, title: "Continue?", buttons: [ControlAskButton(id: "yes", label: "Yes")])
+        #expect(session.openAsk(ask))
+        #expect(AskRegistry.shared.register(id: ask.id, owner: .session(session.id, window: windowID)))
+        defer { session.cancelAsk(id: ask.id) }
+
+        if terminating {
+            library.isTerminating = true
+            library.closeWindow(windowID)
+        } else {
+            library.removeWindow(windowID)
+        }
+
+        #expect(library.store(for: windowID)?.session(withID: session.id) === session)
+        #expect(session.askPending == ask)
+        #expect(AskRegistry.shared.owner(for: ask.id) == .session(session.id, window: windowID))
+    }
+
     private let directory: URL
 
     init() throws {
@@ -54,6 +109,14 @@ final class WindowLibraryTests {
         #expect(library.windowName(for: work.id) == "work")
         #expect(library.windowName(for: nil) == "")
         #expect(library.windowName(for: UUID()) == "")
+    }
+
+    @Test func customWindowNameSkipsAutoNamesAndUnknownIDs() {
+        let library = WindowLibrary(directory: directory)
+        #expect(library.customWindowName(for: library.windows[0].id) == nil)
+        let work = library.newWindow(name: "work")
+        #expect(library.customWindowName(for: work.id) == "work")
+        #expect(library.customWindowName(for: UUID()) == nil)
     }
 
     @Test func allOpenSessionsFlattensEverySessionAcrossWindows() {
@@ -126,6 +189,200 @@ final class WindowLibraryTests {
         #expect(store.selectedSessionID == session.id)
     }
 
+    @Test func reopeningIntoAnotherWindowRestoresWhereTheSessionIsStillPendingItsClose() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let workspace = source.addWorkspace(name: "project")
+        let session = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/project", name: "api"))
+        let destination = try! #require(library.store(for: library.newWindow().id))
+
+        #expect(source.softCloseSession(session.id))
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(library.reopenRecentClosed(recent.id, into: destination))
+
+        #expect(destination.session(withID: session.id) == nil)
+        let restored = try! #require(source.session(withID: session.id))
+        #expect(restored === session)
+        #expect(library.allOpenSessions().filter { $0.id == session.id }.count == 1)
+        #expect(library.store(forSession: session.id) === source)
+    }
+
+    /// A workspace entry whose members are spread over two windows, the shape an older build could save:
+    /// A holds x, B holds y, z survives only in the snapshot. `shell` gives A the entry's own workspace id
+    /// so the merge takes its existing-shell arm rather than rebuilding.
+    private struct SplitWorkspaceSeed {
+        let a: UUID, b: UUID
+        let item: RecentClosedItem
+        let x: UUID, y: UUID, z: UUID
+    }
+
+    private func seedSplitWorkspace(shell: Bool) throws -> SplitWorkspaceSeed {
+        let windowA = UUID(), windowB = UUID(), workspaceID = UUID()
+        let x = SessionSnapshot(id: UUID(), customName: "x", cwd: "/x")
+        let y = SessionSnapshot(id: UUID(), customName: "y", cwd: "/y")
+        let z = SessionSnapshot(id: UUID(), customName: "z", cwd: "/z")
+        try writeWindowFile(windowA, Snapshot(workspaces: [
+            WorkspaceSnapshot(id: shell ? workspaceID : UUID(), name: "A", sessions: [x]),
+        ]))
+        try writeWindowFile(windowB, Snapshot(workspaces: [
+            WorkspaceSnapshot(id: UUID(), name: "B", sessions: [y]),
+        ]))
+        try writeIndex(WindowsIndex(frontmost: windowA, windows: [
+            WindowEntry(id: windowA, name: "a", isOpen: true),
+            WindowEntry(id: windowB, name: "b", isOpen: true),
+        ]))
+        let item = RecentClosedItem(
+            kind: .workspace, title: "original", subtitle: nil,
+            workspace: RecentClosedWorkspace(
+                snapshot: WorkspaceSnapshot(id: workspaceID, name: "original", sessions: [x, y, z]),
+                selectedSessionID: z.id))
+        RecentClosedStore(directory: directory).record(item)
+        return SplitWorkspaceSeed(a: windowA, b: windowB, item: item, x: x.id, y: y.id, z: z.id)
+    }
+
+    @Test(arguments: [false, true], [false, true])
+    func reopeningASplitWorkspaceRebuildsOnlyTheMemberNobodyHolds(shell: Bool, externalPending: Bool) throws {
+        let seed = try seedSplitWorkspace(shell: shell)
+        let library = WindowLibrary(directory: directory)
+        let a = try! #require(library.store(for: seed.a))
+        let b = try! #require(library.store(for: seed.b))
+        let originalX = try! #require(a.session(withID: seed.x))
+        let originalY = try! #require(b.session(withID: seed.y))
+        if externalPending { #expect(b.softCloseSession(seed.y, grace: 60)) }
+
+        #expect(library.reopenRecentClosedReportingWindow(seed.item.id, into: a) == seed.a)
+
+        #expect(a.session(withID: seed.x) === originalX)
+        #expect(a.session(withID: seed.y) == nil, "y belongs to the other window")
+        #expect(a.session(withID: seed.z) != nil, "z exists only in the snapshot and must come back")
+        #expect(library.recentClosedItems.contains { $0.id == seed.item.id } == false)
+        if externalPending { #expect(b.undoPendingClose()) }
+        #expect(b.session(withID: seed.y) === originalY)
+        for id in [seed.x, seed.y, seed.z] {
+            #expect(library.allOpenSessions().filter { $0.id == id }.count == 1, "\(id) must exist once")
+        }
+    }
+
+    @Test func reopeningAWorkspacePendingItsCloseRestoresTheOriginalObjects() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let sourceWindow = try! #require(library.windowID(for: source))
+        let workspace = source.addWorkspace(name: "project")
+        let session = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/project", name: "api"))
+        let destination = try! #require(library.store(for: library.newWindow().id))
+
+        #expect(source.softRemoveWorkspace(workspace.id, grace: 60))
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(recent.kind == .workspace)
+        #expect(library.reopenRecentClosedReportingWindow(recent.id, into: destination) == sourceWindow)
+
+        #expect(destination.workspaces.contains { $0.id == workspace.id } == false)
+        #expect(source.session(withID: session.id) === session)
+        #expect(source.pendingHoldsWorkspace(workspace.id) == false, "the pending close is consumed")
+        #expect(library.allOpenSessions().filter { $0.id == session.id }.count == 1)
+    }
+
+    @Test func reopeningAnEmptyWorkspacePendingItsCloseStillFindsItsOwner() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let sourceWindow = try! #require(library.windowID(for: source))
+        let workspace = source.addWorkspace(name: "empty")
+        let destination = try! #require(library.store(for: library.newWindow().id))
+
+        #expect(source.softRemoveWorkspace(workspace.id, grace: 60))
+        let recent = try! #require(library.recentClosedItems.first)
+        // an empty entry has no session ids, so only the workspace lookup can locate the owner.
+        #expect(library.reopenRecentClosedReportingWindow(recent.id, into: destination) == sourceWindow)
+        #expect(source.workspaces.contains { $0.id == workspace.id })
+        #expect(destination.workspaces.contains { $0.id == workspace.id } == false)
+    }
+
+    // older versions could persist the same session in two windows.
+    @Test func reopeningASessionPersistedInTwoWindowsDoesNotRebuildTheClosedCopy() throws {
+        let sessionID = UUID(uuidString: "2E126225-06D9-4593-A3E5-E3D69BB195C6")!
+        let workspaceID = UUID(uuidString: "0C33DDDD-0000-0000-0000-000000000033")!
+        let windowA = UUID(uuidString: "0A11AAAA-0000-0000-0000-000000000011")!
+        let windowB = UUID(uuidString: "0B22BBBB-0000-0000-0000-000000000022")!
+        let shared = SessionSnapshot(id: sessionID, customName: "api", cwd: "/project")
+        try writeWindowFile(windowA, Snapshot(workspaces: [
+            WorkspaceSnapshot(id: workspaceID, name: "project", sessions: [shared]),
+        ]))
+        try writeWindowFile(windowB, Snapshot(workspaces: [
+            WorkspaceSnapshot(id: UUID(), name: "elsewhere", sessions: [shared]),
+        ]))
+        try writeIndex(WindowsIndex(frontmost: windowA, windows: [
+            WindowEntry(id: windowA, name: "a", isOpen: true),
+            WindowEntry(id: windowB, name: "b", isOpen: true),
+        ]))
+
+        let library = WindowLibrary(directory: directory)
+        #expect(library.allOpenSessions().filter { $0.id == sessionID }.count == 2)
+        let storeA = try! #require(library.store(for: windowA))
+        let storeB = try! #require(library.store(for: windowB))
+
+        storeA.closeSession(sessionID)
+        #expect(library.allOpenSessions().filter { $0.id == sessionID }.count == 1)
+
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(library.reopenRecentClosedReportingWindow(recent.id) == windowB)
+        #expect(library.allOpenSessions().filter { $0.id == sessionID }.count == 1)
+        #expect(storeA.session(withID: sessionID) == nil)
+        #expect(storeB.session(withID: sessionID) != nil)
+    }
+
+    @Test func reopeningFollowsTheWorkspaceOwnerRatherThanTheRequestedWindow() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let sourceWindow = try! #require(library.windowID(for: source))
+        let workspace = source.addWorkspace(name: "project")
+        let x = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/x", name: "x"))
+        _ = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/y", name: "y"))
+        let destination = try! #require(library.store(for: library.newWindow().id))
+
+        source.closeSession(x.id)
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(library.reopenRecentClosedReportingWindow(recent.id, into: destination) == sourceWindow)
+
+        #expect(destination.workspaces.contains { $0.id == workspace.id } == false)
+        #expect(source.session(withID: x.id) != nil)
+        #expect(library.allOpenSessions().filter { $0.id == x.id }.count == 1)
+    }
+
+    @Test func reopeningAWorkspaceNobodyHoldsStillGoesToTheRequestedWindow() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let workspace = source.addWorkspace(name: "project")
+        let x = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/x", name: "x"))
+        let y = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/y", name: "y"))
+        let destination = try! #require(library.store(for: library.newWindow().id))
+        let destinationWindow = try! #require(library.windowID(for: destination))
+
+        source.removeWorkspace(workspace.id)
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(recent.kind == .workspace)
+        #expect(library.reopenRecentClosedReportingWindow(recent.id, into: destination) == destinationWindow)
+
+        let restored = try! #require(destination.workspaces.first { $0.id == workspace.id })
+        #expect(restored.sessions.map(\.id) == [x.id, y.id])
+        #expect(library.recentClosedItems.isEmpty)
+    }
+
+    @Test func reopeningIntoAnotherWindowRestoresWhereTheSessionIsStillLive() {
+        let library = WindowLibrary(directory: directory)
+        let source = try! #require(library.activeStore)
+        let workspace = source.addWorkspace(name: "project")
+        let session = try! #require(source.addSession(toWorkspace: workspace.id, cwd: "/project", name: "api"))
+        let destination = try! #require(library.store(for: library.newWindow().id))
+
+        source.closeSession(session.id)
+        let recent = try! #require(library.recentClosedItems.first)
+        #expect(source.restoreRecentClosed(recent))
+        #expect(library.reopenRecentClosed(recent.id, into: destination))
+
+        #expect(destination.session(withID: session.id) == nil)
+        #expect(library.allOpenSessions().filter { $0.id == session.id }.count == 1)
+    }
+
     @Test func reopeningStaleRecentSessionSelectsExistingSessionInsteadOfDuplicatingID() {
         let library = WindowLibrary(directory: directory)
         let store = try! #require(library.activeStore)
@@ -180,6 +437,20 @@ final class WindowLibraryTests {
         #expect(matchingWorkspaces.count == 1)
         #expect(matchingSessions.count == 1)
         #expect(store.selectedSessionID == session.id)
+    }
+
+    @Test func theStoreHoldingASessionIsFoundWhileItsCloseCanBeUndone() throws {
+        let library = WindowLibrary(directory: directory)
+        let store = try #require(library.activeStore)
+        let session = try #require(store.addSession(toWorkspace: store.workspaces[0].id, cwd: "/tmp", name: "grace"))
+        #expect(library.store(holdingSession: session.id) === store)
+
+        #expect(store.softCloseSession(session.id, grace: 60))
+        #expect(library.store(forSession: session.id) == nil)
+        #expect(library.store(holdingSession: session.id) === store)
+
+        store.finalizeAllPendingCloses()
+        #expect(library.store(holdingSession: session.id) == nil)
     }
 
     @Test func reopeningRecentDuringGraceRestoresPendingSessionWithoutRebuildingSnapshot() {
@@ -575,6 +846,56 @@ final class WindowLibraryTests {
         #expect(!library.isOpen(extra.id))
         #expect(library.windows.contains { $0.id == extra.id })
         #expect(library.openIDs() == [library.windows[0].id])
+    }
+
+    @Test func windowStepWrapsBothWaysInLibraryOrder() {
+        let library = WindowLibrary(directory: directory)
+        let first = library.windows[0].id
+        let second = library.newWindow(name: "second").id
+        let third = library.newWindow(name: "third").id
+        #expect(library.canStepWindows)
+
+        library.frontmostWindowID = first
+        #expect(library.navigateWindow(.next) == second)
+        #expect(library.navigateWindow(.previous) == third)
+        library.frontmostWindowID = third
+        #expect(library.navigateWindow(.next) == first)
+        #expect(library.navigateWindow(.previous) == second)
+    }
+
+    @Test func windowStepSkipsClosedEntries() {
+        let library = WindowLibrary(directory: directory)
+        let first = library.windows[0].id
+        let middle = library.newWindow(name: "middle").id
+        let last = library.newWindow(name: "last").id
+        library.closeWindow(middle)
+
+        library.frontmostWindowID = first
+        #expect(library.navigateWindow(.next) == last)
+        #expect(library.navigateWindow(.previous) == last)
+    }
+
+    @Test func windowStepIsNilWithOneOpenWindow() {
+        let library = WindowLibrary(directory: directory)
+        let extra = library.newWindow(name: "extra").id
+        library.closeWindow(extra)
+        #expect(!library.canStepWindows)
+        #expect(library.navigateWindow(.next) == nil)
+        #expect(library.navigateWindow(.previous) == nil)
+    }
+
+    @Test func windowStepStartsFromTheResolvedActiveWindowWhenFrontmostIsClosed() {
+        // `activeWindowID` falls back to the first OPEN window, so a step after the frontmost closed
+        // leaves from that survivor rather than returning nil.
+        let library = WindowLibrary(directory: directory)
+        let first = library.windows[0].id
+        let second = library.newWindow(name: "second").id
+        let third = library.newWindow(name: "third").id
+        library.frontmostWindowID = third
+        library.closeWindow(third)
+
+        #expect(library.activeWindowID == first)
+        #expect(library.navigateWindow(.next) == second)
     }
 
     @Test func closeUnknownWindowIsNoOp() {
@@ -1032,6 +1353,30 @@ final class WindowLibraryTests {
         #expect(library.claimNextWindowID() == nil)
     }
 
+    // #626: a window deleted before its scene claimed it left a dead id for the next window to pop.
+    @Test func removeWindowPurgesItsPendingClaim() throws {
+        let library = WindowLibrary(directory: directory)
+        _ = library.consumeReopen()
+        _ = library.claimNextWindowID()
+        let extra = library.newWindow(name: "extra").id
+        library.enqueueClaim(extra)
+        library.removeWindow(extra)
+        #expect(library.claimNextWindowID() == nil)
+    }
+
+    @Test func rejectedRemoveOfLastWindowKeepsItsPendingClaim() throws {
+        let library = WindowLibrary(directory: directory)
+        let launch = library.windows[0].id
+        _ = library.consumeReopen()
+        _ = library.claimNextWindowID()
+        let extra = library.newWindow(name: "extra").id
+        library.enqueueClaim(extra)
+        library.removeWindow(launch)
+        library.removeWindow(extra)
+        #expect(library.windows.map(\.id) == [extra])
+        #expect(library.claimNextWindowID() == extra)
+    }
+
     // two adoptLaunchWindowID() calls before consumeReopen (SwiftUI restored more than one window,
     // each hitting the empty-queue fallback) must NOT both get the same launch id — only the first
     // does; the second gets nil and dismisses itself, so two windows can't bind the one launch store.
@@ -1475,4 +1820,144 @@ final class WindowLibraryTests {
         #expect(!library.saveAllOpenChecked())
     }
 
+    // MARK: - launch pane drops
+
+    private final class DropLog {
+        var identities: [UUID] = []
+    }
+
+    @Test func closingAWindowDropsEveryPaneItHeld() throws {
+        let log = DropLog()
+        let library = WindowLibrary(directory: directory, paneFinalizer: nil, launchPaneDrop: { log.identities += $0 })
+        let work = library.newWindow(name: "work")
+        let store = try #require(library.store(for: work.id))
+        let session = try #require(store.addSession(toWorkspace: store.workspaces[0].id, cwd: "/tmp"))
+        let expected = Set(PaneIdentityInventory.identities(in: store.workspaces.flatMap(\.sessions)))
+
+        library.closeWindow(work.id)
+
+        #expect(Set(log.identities) == expected)
+        #expect(log.identities.contains(session.paneIdentity))
+    }
+
+    @Test func removingAWindowDropsEveryPaneItHeld() throws {
+        let log = DropLog()
+        let library = WindowLibrary(directory: directory, paneFinalizer: nil, launchPaneDrop: { log.identities += $0 })
+        let work = library.newWindow(name: "work")
+        let store = try #require(library.store(for: work.id))
+        let expected = Set(PaneIdentityInventory.identities(in: store.workspaces.flatMap(\.sessions)))
+
+        library.removeWindow(work.id)
+
+        #expect(Set(log.identities) == expected)
+        #expect(!expected.isEmpty)
+    }
+
+    private func addSession(to store: AppStore, status: AgentStatus) throws -> Session {
+        let session = try #require(store.addSession(toWorkspace: store.workspaces[0].id, cwd: "/tmp"))
+        store.setAgentIndicator(AgentIndicator(status: status), forSession: session.id)
+        return session
+    }
+
+    @Test func attentionAcrossWindowsRanksStatusBeforeWindowOrder() throws {
+        let library = WindowLibrary(directory: directory)
+        let first = try #require(library.activeWindowID)
+        let firstStore = try #require(library.store(for: first))
+        let second = library.newWindow(name: "second")
+        let secondStore = try #require(library.store(for: second.id))
+        let blocked = try addSession(to: secondStore, status: .blocked)
+        let completed = try addSession(to: firstStore, status: .completed)
+        let active = try addSession(to: firstStore, status: .active)
+
+        let entries = library.attentionAcrossWindows
+
+        #expect(entries.map(\.session.id) == [blocked.id, active.id, completed.id])
+        #expect(entries.map(\.window.id) == [second.id, first, first])
+    }
+
+    @Test func attentionAcrossWindowsOrdersASharedRankNewestFirstAcrossWindows() throws {
+        let library = WindowLibrary(directory: directory)
+        let firstStore = try #require(library.activeStore)
+        let second = library.newWindow(name: "second")
+        let secondStore = try #require(library.store(for: second.id))
+        let older = try addSession(to: firstStore, status: .blocked)
+        let newer = try addSession(to: secondStore, status: .blocked)
+
+        #expect(library.attentionAcrossWindows.map(\.session.id) == [newer.id, older.id])
+    }
+
+    @Test func attentionAcrossWindowsMatchesTheSingleWindowList() throws {
+        let library = WindowLibrary(directory: directory)
+        let store = try #require(library.activeStore)
+        _ = try addSession(to: store, status: .completed)
+        _ = try addSession(to: store, status: .blocked)
+        _ = try addSession(to: store, status: .active)
+
+        #expect(library.attentionAcrossWindows.map(\.session.id) == store.attentionSessions.map(\.id))
+    }
+
+    @Test func attentionAcrossWindowsSkipsClosedWindows() throws {
+        let library = WindowLibrary(directory: directory)
+        let first = try #require(library.activeWindowID)
+        let firstStore = try #require(library.store(for: first))
+        let second = library.newWindow(name: "second")
+        let secondStore = try #require(library.store(for: second.id))
+        _ = try addSession(to: secondStore, status: .blocked)
+        let kept = try addSession(to: firstStore, status: .completed)
+
+        library.closeWindow(second.id)
+
+        #expect(library.attentionAcrossWindows.map(\.session.id) == [kept.id])
+    }
+
+    @Test func attentionAcrossWindowsInvalidatesWhenABackgroundWindowCloses() throws {
+        let library = WindowLibrary(directory: directory)
+        let first = try #require(library.activeWindowID)
+        let second = library.newWindow(name: "second")
+        let secondStore = try #require(library.store(for: second.id))
+        _ = try addSession(to: secondStore, status: .blocked)
+        library.frontmostWindowID = first
+        let fired = Flag()
+        withObservationTracking {
+            _ = library.attentionAcrossWindows
+        } onChange: {
+            fired.set()
+        }
+
+        library.closeWindow(second.id)
+
+        #expect(fired.isSet)
+        #expect(library.windows.count == 2)
+        #expect(library.frontmostWindowID == first)
+        #expect(library.attentionAcrossWindows.isEmpty)
+    }
+
+    @Test func attentionSubtitleNamesTheWindowOnlyWithSeveralOpen() throws {
+        let library = WindowLibrary(directory: directory)
+        let store = try #require(library.activeStore)
+        let session = try addSession(to: store, status: .blocked)
+        let single = try #require(library.attentionAcrossWindows.first)
+        #expect(library.attentionSubtitle(single) == "workspace 1 · \(session.subtitleDetail)")
+
+        let second = library.newWindow(name: "second")
+        let entry = try #require(library.attentionAcrossWindows.first { $0.session.id == session.id })
+        #expect(library.attentionSubtitle(entry) == "\(entry.window.name) · workspace 1 · \(session.subtitleDetail)")
+
+        library.closeWindow(second.id)
+        #expect(library.attentionSubtitle(entry) == "workspace 1 · \(session.subtitleDetail)")
+    }
+
+    @Test func attentionSubtitleNamesTheHostOfARemoteSession() throws {
+        let library = WindowLibrary(directory: directory)
+        let store = try #require(library.activeStore)
+        let session = try #require(store.addSession(toWorkspace: store.workspaces[0].id, cwd: "/tmp", remoteHost: "buildbox"))
+        store.setAgentIndicator(AgentIndicator(status: .blocked), forSession: session.id)
+        let entry = try #require(library.attentionAcrossWindows.first)
+        #expect(library.attentionSubtitle(entry) == "workspace 1 · buildbox · \(session.subtitleDetail)")
+    }
+
+    private final class Flag: @unchecked Sendable {
+        private(set) var isSet = false
+        func set() { isSet = true }
+    }
 }

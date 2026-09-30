@@ -35,6 +35,36 @@ struct Keymap: ParsableCommand {
     }
 }
 
+// MARK: - hooks
+
+struct Hooks: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Event hook commands.",
+        subcommands: [Reload.self, List.self]
+    )
+
+    struct Reload: RequestCommand {
+        static let configuration = CommandConfiguration(abstract: "Re-read and apply hooks.conf (prints the diagnostic count).")
+        // app-global like the keymap commands, so no `--window`.
+        @OptionGroup var options: BasicOptions
+
+        func makeRequest() throws -> ControlRequest { ControlRequest(cmd: .hooksReload) }
+    }
+
+    struct List: RequestCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Show every hook with its running child, queue depth, dropped count and last failure.",
+            discussion: "One row per `on <kind> <shell...>` line in file order, then any hook removed from the file "
+                + "whose child is still running, marked retired. `running` is the child's pid and elapsed seconds "
+                + "while a hook is busy; `pending` is how many events wait behind it and `dropped` how many the "
+                + "bounded queue discarded; `last failure` stays until the hook's next clean run (a reload keeps it)."
+        )
+        @OptionGroup var options: BasicOptions
+
+        func makeRequest() throws -> ControlRequest { ControlRequest(cmd: .hooksList) }
+    }
+}
+
 // MARK: - config
 
 struct Config: ParsableCommand {
@@ -57,7 +87,7 @@ struct Config: ParsableCommand {
 struct Restore: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Restore-running-command commands.",
-        subcommands: [Capture.self, Clear.self]
+        subcommands: [Capture.self, Clear.self, Mode.self]
     )
 
     struct Capture: RequestCommand {
@@ -78,13 +108,49 @@ struct Restore: ParsableCommand {
             pane comes back running the capture command. Bind it or run it from a scheduled job rather than \
             by hand; "restore clear" is app-global, so it is no per-pane undo.
 
-            Needs "Restore running commands on restart", which is what replays the capture: with the \
-            setting off this captures nothing and fails, saying so.
+            This command is available only when this launch is in rerun mode. In fresh-shell or live mode \
+            it fails and names the active mode.
             """)
         // app-global, like `restore clear`: every open window, so no `--window` selector.
         @OptionGroup var options: BasicOptions
 
         func makeRequest() throws -> ControlRequest { ControlRequest(cmd: .restoreCapture) }
+    }
+
+    struct Mode: RequestCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Read or set what a restart does with your sessions.",
+            discussion: """
+            With no argument this reports the policy: what settings hold for the next launch, what THIS \
+            launch asked for, and what it actually got. The two requested values differ once the mode has \
+            been changed since this instance started, which is exactly when a caller is confused about why \
+            nothing happened.
+
+            Setting one writes it for the NEXT launch. This process keeps the mode it started with, and \
+            that is not a shortcut: a pane is wrapped in a zmx daemon or not at the moment it is created, \
+            so no setting can retrofit a shell that is already running.
+
+            fresh shells (none) re-spawns each pane in its saved directory. re-run (rerun) starts the \
+            command each pane had at the last clean quit. live keeps the actual processes alive.
+
+            Switching away from live and restarting ends every detached live process in this state \
+            directory. If live was requested but could not be used, the reason is reported here.
+            """)
+        @Argument(help: "none|rerun|live. Omit to read the current policy.")
+        var mode: String?
+
+        @OptionGroup var options: BasicOptions
+
+        func validate() throws {
+            guard let mode else { return }
+            guard RestoreMode(rawValue: mode) != nil else {
+                throw ValidationError("mode must be none, rerun, or live")
+            }
+        }
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .restoreMode, args: mode.map { ControlArgs(mode: $0) })
+        }
     }
 
     struct Clear: RequestCommand {
@@ -177,16 +243,16 @@ struct Quick: ParsableCommand {
         @OptionGroup var options: BasicOptions
 
         func makeRequest() throws -> ControlRequest {
-            let payload: String
             if stdin {
-                // non-UTF8 stdin decodes to nil and injects nothing — terminal input is UTF-8 text.
-                let data = FileHandle.standardInput.readDataToEndOfFile()
-                payload = String(data: data, encoding: .utf8) ?? ""
-            } else if let text {
-                payload = text
-            } else {
-                throw ValidationError("provide TEXT or --stdin")
+                return try makeRequest(input: FileHandle.standardInput.readDataToEndOfFile())
             }
+            guard let text else { throw ValidationError("provide TEXT or --stdin") }
+            return makeRequest(payload: text)
+        }
+
+        func makeRequest(input: Data) throws -> ControlRequest { makeRequest(payload: try decodeTypedStdin(input)) }
+
+        private func makeRequest(payload: String) -> ControlRequest {
             return ControlRequest(cmd: .quickType, args: ControlArgs(text: payload))
         }
     }
@@ -342,6 +408,8 @@ struct Pick: ParsableCommand {
         @Option(name: .long, help: "Initial text for the picker query field; it opens already filtered.")
         var query: String?
         @Flag(name: .long, help: "Accept the current query as a custom result.") var allowCustom = false
+        @Option(name: .long, help: "Item id to open highlighted; a --query that hides it falls back to the first row.")
+        var select: String?
         @Flag(name: .long, help: "Raise the target window when the picker opens.") var follow = false
         @Flag(name: .long, help: "Print the picker id and return without waiting for a result.") var noBlock = false
         @OptionGroup var options: ClientOptions
@@ -357,7 +425,8 @@ struct Pick: ParsableCommand {
                 items: try Self.parseItems(input),
                 prompt: prompt,
                 query: query,
-                allowCustom: allowCustom ? true : nil
+                allowCustom: allowCustom ? true : nil,
+                selection: select
             )
             return ControlRequest(cmd: .pickOpen, args: options.withWindow(args))
         }
@@ -385,7 +454,7 @@ struct Pick: ParsableCommand {
                 send: client.send,
                 sleep: Thread.sleep(forTimeInterval:),
                 output: { print($0) },
-                errorOutput: Self.writeStandardError
+                errorOutput: ModalCommandRunner.writeStandardError
             )
         }
 
@@ -393,82 +462,14 @@ struct Pick: ParsableCommand {
         /// real delays or process fds.
         func execute(
             input: Data,
-            send: (ControlRequest) throws -> ControlResponse,
-            sleep: (TimeInterval) -> Void,
-            output: (String) -> Void,
-            errorOutput: (String) -> Void = Self.writeStandardError
+            send: @escaping (ControlRequest) throws -> SocketReply,
+            sleep: @escaping (TimeInterval) -> Void,
+            output: @escaping (String) -> Void,
+            errorOutput: @escaping (String) -> Void = ModalCommandRunner.writeStandardError
         ) throws {
-            let opened = try send(makeRequest(input: input))
-            guard opened.ok else {
-                Self.writeResponse(opened, json: options.json, output: output, errorOutput: errorOutput)
-                throw ExitCode.failure
-            }
-            guard let pickID = opened.result?.id else {
-                errorOutput("error: pick.open result missing id")
-                throw ExitCode.failure
-            }
-            if noBlock {
-                output(try SocketClient.formatPickID(pickID))
-                return
-            }
-
-            var pendingPolls = 0
-            while true {
-                let response: ControlResponse
-                do {
-                    response = try send(ControlRequest(cmd: .pickResult, target: pickID))
-                } catch {
-                    // a transport failure mid-wait leaves the picker up with nobody waiting; every request
-                    // opens its own connection, so the cancel can still land though this poll could not.
-                    abandon(pickID, send: send)
-                    throw error
-                }
-                // the poll carries no window selector, so a pending picker is always found by id and answers
-                // ok; a not-ok response means the server no longer holds one, with nothing left to dismiss.
-                guard response.ok else {
-                    Self.writeResponse(response, json: options.json, output: output, errorOutput: errorOutput)
-                    throw ExitCode.failure
-                }
-                guard let result = response.result?.pick else {
-                    errorOutput("error: pick.result missing result")
-                    abandon(pickID, send: send)
-                    throw ExitCode.failure
-                }
-                if result.result == .pending {
-                    pendingPolls += 1
-                    sleep(SocketClient.pickPollDelay(afterPendingPoll: pendingPolls))
-                    continue
-                }
-
-                output(try SocketClient.formatPickResult(result))
-                let code = SocketClient.pickExitCode(for: result.result)
-                if code.rawValue != 0 { throw code }
-                return
-            }
-        }
-
-        /// Dismiss a picker this command opened but can no longer wait on: else the window holds one whose
-        /// owner is gone and refuses the next `pick.open`. Best effort — the poll already failed anyway.
-        private func abandon(_ pickID: String, send: (ControlRequest) throws -> ControlResponse) {
-            _ = try? send(ControlRequest(cmd: .pickCancel, target: pickID))
-        }
-
-        private static func writeResponse(
-            _ response: ControlResponse,
-            json: Bool,
-            output: (String) -> Void,
-            errorOutput: (String) -> Void
-        ) {
-            let line = SocketClient.formatResponse(response, json: json)
-            if json {
-                output(line)
-            } else {
-                errorOutput(line)
-            }
-        }
-
-        private static func writeStandardError(_ line: String) {
-            FileHandle.standardError.write(Data("\(line)\n".utf8))
+            let runner = ModalCommandRunner(family: .pick, json: options.json, send: send, sleep: sleep,
+                                            output: output, errorOutput: errorOutput)
+            try runner.open(makeRequest(input: input), noBlock: noBlock)
         }
     }
 
@@ -487,38 +488,20 @@ struct Pick: ParsableCommand {
             try execute(
                 send: SocketClient(path: options.socketPath()).send,
                 output: { print($0) },
-                errorOutput: Self.writeStandardError
+                errorOutput: ModalCommandRunner.writeStandardError
             )
         }
 
         /// One-shot read with injectable transport/stdout/stderr, so every wire outcome and exit mapping is
         /// covered without replacing process file descriptors.
         func execute(
-            send: (ControlRequest) throws -> ControlResponse,
-            output: (String) -> Void,
-            errorOutput: (String) -> Void = Self.writeStandardError
+            send: @escaping (ControlRequest) throws -> SocketReply,
+            output: @escaping (String) -> Void,
+            errorOutput: @escaping (String) -> Void = ModalCommandRunner.writeStandardError
         ) throws {
-            let response = try send(makeRequest())
-            guard response.ok else {
-                let line = SocketClient.formatResponse(response, json: options.json)
-                if options.json {
-                    output(line)
-                } else {
-                    errorOutput(line)
-                }
-                throw ExitCode.failure
-            }
-            guard let result = response.result?.pick else {
-                errorOutput("error: pick.result missing result")
-                throw ExitCode.failure
-            }
-            output(try SocketClient.formatPickResult(result))
-            let code = SocketClient.pickExitCode(for: result.result)
-            if code.rawValue != 0 { throw code }
-        }
-
-        private static func writeStandardError(_ line: String) {
-            FileHandle.standardError.write(Data("\(line)\n".utf8))
+            let runner = ModalCommandRunner(family: .pick, json: options.json, send: send, sleep: { _ in },
+                                            output: output, errorOutput: errorOutput)
+            try runner.read(makeRequest())
         }
     }
 
@@ -533,12 +516,112 @@ struct Pick: ParsableCommand {
     }
 }
 
+struct ModalCommandRunner {
+    enum Family: String {
+        case pick, ask
+
+        var resultCommand: Command { self == .pick ? .pickResult : .askResult }
+        var cancelCommand: Command { self == .pick ? .pickCancel : .askCancel }
+    }
+
+    let family: Family
+    let json: Bool
+    let send: (ControlRequest) throws -> SocketReply
+    let sleep: (TimeInterval) -> Void
+    let output: (String) -> Void
+    let errorOutput: (String) -> Void
+
+    func open(_ request: ControlRequest, noBlock: Bool) throws {
+        let opened = try send(request)
+        try requireSuccess(opened)
+        guard let id = opened.response.result?.id else {
+            errorOutput("error: \(family.rawValue).open result missing id")
+            throw ExitCode.failure
+        }
+        if noBlock {
+            output(try SocketClient.formatPickID(id))
+            return
+        }
+        var pendingPolls = 0
+        while true {
+            let polled: SocketReply
+            do {
+                polled = try send(ControlRequest(cmd: family.resultCommand, target: id))
+            } catch {
+                // each request opens its own connection, so cancellation can still reach the host after a failed poll.
+                abandon(id)
+                throw error
+            }
+            // the id-only poll cannot resolve to another window; failure means the host no longer holds the dialog.
+            try requireSuccess(polled)
+            guard let result = try reply(from: polled.response) else {
+                errorOutput("error: \(family.rawValue).result missing result")
+                abandon(id)
+                throw ExitCode.failure
+            }
+            if result.pending {
+                pendingPolls += 1
+                sleep(SocketClient.pickPollDelay(afterPendingPoll: pendingPolls))
+                continue
+            }
+            output(result.line)
+            if result.code.rawValue != 0 { throw result.code }
+            return
+        }
+    }
+
+    func read(_ request: ControlRequest) throws {
+        let polled = try send(request)
+        try requireSuccess(polled)
+        guard let result = try reply(from: polled.response) else {
+            errorOutput("error: \(family.rawValue).result missing result")
+            throw ExitCode.failure
+        }
+        output(result.line)
+        if result.code.rawValue != 0 { throw result.code }
+    }
+
+    private struct Reply {
+        let pending: Bool
+        let line: String
+        let code: ExitCode
+    }
+
+    private func reply(from response: ControlResponse) throws -> Reply? {
+        switch family {
+        case .pick:
+            guard let result = response.result?.pick else { return nil }
+            return Reply(pending: result.result == .pending, line: try SocketClient.formatPickResult(result),
+                         code: SocketClient.pickExitCode(for: result.result))
+        case .ask:
+            guard let result = response.result?.ask else { return nil }
+            return Reply(pending: result.result == .pending, line: try SocketClient.formatAskResult(result),
+                         code: SocketClient.askExitCode(for: result.result))
+        }
+    }
+
+    private func requireSuccess(_ reply: SocketReply) throws {
+        guard !reply.response.ok else { return }
+        if json { output(reply.line) } else { errorOutput(SocketClient.formatResponse(reply.response)) }
+        throw ExitCode.failure
+    }
+
+    // otherwise an abandoned caller leaves the shared modal slot occupied; cancellation stays best effort.
+    private func abandon(_ id: String) {
+        _ = try? send(ControlRequest(cmd: family.cancelCommand, target: id))
+    }
+
+    static func writeStandardError(_ line: String) {
+        FileHandle.standardError.write(Data("\(line)\n".utf8))
+    }
+}
+
 // MARK: - sidebar
 
 struct Sidebar: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Sidebar visibility and view mode.",
-        subcommands: [Visibility.self, Mode.self, Expand.self, Collapse.self],
+        subcommands: [Visibility.self, Mode.self, FlaggedLayout.self, Expand.self, Collapse.self, Width.self],
         defaultSubcommand: Visibility.self
     )
 
@@ -554,7 +637,7 @@ struct Sidebar: ParsableCommand {
         }
     }
 
-    /// Flips the frontmost window's sidebar between the workspace tree and the flat flagged working-set list.
+    /// Flips the frontmost window's sidebar between the workspace tree and the flagged working-set view.
     struct Mode: RequestCommand {
         static let configuration = CommandConfiguration(commandName: "mode", abstract: "Sidebar view mode (tree|flagged|toggle).")
         @Argument(help: "Mode: tree, flagged, or toggle (default).") var mode: String = "toggle"
@@ -568,6 +651,24 @@ struct Sidebar: ParsableCommand {
 
         func makeRequest() throws -> ControlRequest {
             ControlRequest(cmd: .sidebarMode, args: ControlArgs(mode: mode))
+        }
+    }
+
+    /// Sets how every window's flagged sidebar view arranges its sessions; app-wide, so no `--window`.
+    struct FlaggedLayout: RequestCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "flagged-layout", abstract: "Flagged view layout (flat|tree|toggle).")
+        @Argument(help: "Layout: flat, tree, or toggle (default).") var layout: String = "toggle"
+        @OptionGroup var options: BasicOptions
+
+        func validate() throws {
+            guard ["flat", "tree", "toggle"].contains(layout) else {
+                throw ValidationError("layout must be flat, tree, or toggle")
+            }
+        }
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .sidebarFlaggedLayout, args: ControlArgs(mode: layout))
         }
     }
 
@@ -586,6 +687,23 @@ struct Sidebar: ParsableCommand {
         @OptionGroup var options: ClientOptions
 
         func makeRequest() throws -> ControlRequest { ControlRequest(cmd: .sidebarCollapse, args: options.withWindow()) }
+    }
+
+    /// `agtermctl sidebar width <points> [--window W]` — move the divider a drag would move. Prints the
+    /// APPLIED width, so a value outside the bounds reads back as the clamped one rather than as what was
+    /// asked for. Range validation stays server-side, against the same bounds the drag clamps to.
+    struct Width: RequestCommand {
+        static let configuration = CommandConfiguration(abstract: "Set the sidebar width in points.")
+        @Argument(help: "Sidebar width in points, clamped to the drag range.") var points: Double
+        @OptionGroup var options: ClientOptions
+
+        func validate() throws {
+            guard points.isFinite else { throw ValidationError("points must be a number") }
+        }
+
+        func makeRequest() throws -> ControlRequest {
+            ControlRequest(cmd: .sidebarWidth, args: options.withWindow(ControlArgs(sidebarWidth: points)))
+        }
     }
 }
 

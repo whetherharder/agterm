@@ -29,7 +29,7 @@ jobs:
         with:
           # scripts/build.sh names the app after the latest reachable v-tag
           fetch-depth: 0
-      # a key of its own: same runner arch as the ci.yml cache, different slices inside the xcframework
+      # keys of their own: same runner arch as the ci.yml caches, different slices inside the artifacts
       - name: Cache libghostty (universal GhosttyKit + resources)
         uses: actions/cache@v6
         with:
@@ -37,20 +37,28 @@ jobs:
             GhosttyKit.xcframework
             agterm/Resources/ghostty
             agterm/Resources/terminfo
+            .ghostty-build-stamp
           key: ghosttykit-universal-${{ runner.arch }}-${{ hashFiles('scripts/setup.sh') }}
+      - name: Cache zmx (universal)
+        uses: actions/cache@v6
+        with:
+          path: |
+            agterm/Resources/zmx
+            .zmx-build-stamp
+          key: zmx-universal-${{ runner.arch }}-${{ hashFiles('scripts/setup.sh', 'scripts/zmx-patches/*.patch') }}
       - name: Install xcodegen
         run: brew install xcodegen
       - name: Build the app (Release, universal)
         env:
           AGTERM_UNIVERSAL: "1"
         run: scripts/build.sh
-      # xcodebuild builds the app and SwiftPM the CLI it bundles, so a thin agtermctl inside a
+      # xcodebuild builds the app, SwiftPM the Swift helpers and zig zmx, so a thin helper inside a
       # universal bundle would ship unnoticed — and fail only on the arch it was not built for.
       - name: Verify every binary carries both slices
         shell: bash
         run: |
           app=build/DerivedData/Build/Products/Release/agterm.app
-          for binary in "$app/Contents/MacOS/agterm" "$app/Contents/MacOS/agtermctl"; do
+          for binary in "$app"/Contents/MacOS/{agterm,agtermctl,agterm-session-host,zmx}; do
             archs="$(lipo -archs "$binary")"
             for arch in arm64 x86_64; do
               case " $archs " in

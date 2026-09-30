@@ -13,20 +13,23 @@ agtermctl tree --json        # workspaces -> sessions, active/split/overlay/scra
 agtermctl window list --json # windows, with open/active flags
 
 # what is each pane RUNNING right now (foreground argv; absent at the shell prompt or for a setuid program like top/sudo)
-agtermctl tree --json | jq -r '.result.tree.workspaces[].sessions[] | "\(.name): \(.foreground // "shell")"'
+# foregroundShell names the shell holding the foreground, so an existing pane with neither could not be read.
+# it does NOT mean the pane is at a prompt: a builtin like `read` runs inside the shell and looks the same
+agtermctl tree --json | jq -r '.result.tree.workspaces[].sessions[]
+  | "\(.name): \(.foreground // .foregroundShell // "unknown")"'
 ```
 
 ## Capture or reset the restore-on-restart commands
 
-The opt-in "Restore running commands on restart" setting saves each pane's foreground command at quit.
-Clear those saved commands so the next launch restores plain shells:
+The `rerun` restore mode saves each pane's foreground command at quit. Clear those saved commands in any
+mode so a future rerun launch restores plain shells:
 
 ```bash
 agtermctl restore clear
 ```
 
 Or capture them now, so an exit that never reaches a clean quit (a force quit, a crash, a hard reset)
-restores like one. It needs the setting on, and answers with the number of panes it captured:
+restores like one. It requires this launch to be in `rerun` mode and answers with the number of panes it captured:
 
 ```bash
 agtermctl restore capture
@@ -35,12 +38,92 @@ agtermctl restore capture
 Use a keybind or a scheduled job rather than typing it at a prompt: run by hand it records ITSELF, being
 that pane's foreground process while it runs, and `restore clear` is app-global so it is no per-pane undo.
 
+## See and clean up the daemons behind live sessions
+
+In `live` mode each primary and split pane runs inside a zmx daemon that outlives the app. List them with
+the pane that claims each one:
+
+```bash
+agtermctl zmx list
+```
+
+A `claimed` row with zero clients is a CLOSED window's pane, which is its resting state, not a leak. Only
+`orphan` rows are eligible for cleanup, and prune refuses entirely if the pane inventory is incomplete:
+
+```bash
+agtermctl zmx prune
+```
+
+To destroy one pane's daemon and the process in it, name the session and the pane and confirm. All three
+are required because this kills a backend process, reaching a pane no window is showing and every client
+attached to it:
+
+```bash
+agtermctl zmx kill --target 3f2a --pane left --force
+```
+
+To move every live session created before the session host under it, so a tool's microphone permission
+stops being asked per version, reset them. agterm quits and reopens itself right after the reply, so run
+this from outside the sessions it affects, or expect the calling shell to end:
+
+```bash
+agtermctl zmx reset --force
+```
+
+## Attach a session running on another Mac
+
+List what the other machine offers across every open window, then open one here by its ID. The far side
+has to be in `live` mode, reachable over ssh with key-based auth, and carry `agtermctl` from the cask or
+the Help action — running agterm alone leaves no CLI an ssh command can find. Run it with no host to ask
+the same of this app, which is the form the remote call runs over there:
+
+```bash
+agtermctl zmx tree studio.local
+agtermctl zmx attach studio.local 7c1e4a02-...
+# Place it in a specific open local window.
+agtermctl zmx attach studio.local 7c1e4a02-... --window "$window_id"
+```
+
+To let the user choose, pipe the listing through the picker:
+
+```bash
+s=$(agtermctl zmx tree studio.local --json |
+  jq '[.result.remote.sessions[] | {id, label: .name,
+        subtitle: (.windowName + "/" + .workspaceName + "  " + .cwd)}]' |
+  agtermctl pick --prompt "Attach which session?" | jq -r '.id // empty')
+[ -n "$s" ] && agtermctl zmx attach studio.local "$s"
+```
+
+The row is marked remote and carries `remoteHost` in the tree. Closing it ends only this side's connection,
+and it does not come back after a relaunch.
+
+Status, context, `notify` and HUD calls made by a program inside that session show on both Macs. Check the
+mirroring stream, which needs `agtermctl` on the far side's ssh PATH:
+
+```sh
+agtermctl tree --json | jq '.. | objects | select(.remoteHost) | {name, presentation}'
+```
+
+## Read or change the local restore policy
+
+This is about THIS instance, not a remote one: `zmx attach` requires nothing of the local restore mode.
+A mode you set applies to the NEXT launch, because a pane is wrapped in a daemon or not at the moment it
+is created:
+
+```bash
+agtermctl restore mode          # what settings hold, what this launch asked for, what it got
+agtermctl restore mode live     # for the next launch
+```
+
 ## Pin what a pane restores (per-session override)
 
 `session restore` pins a shell line that a pane re-runs on the NEXT launch, overriding the captured
 foreground. It is written now and consumed at the next launch (it never touches the running session), and
 it is sticky — it fires again on every restart until cleared. Read it back on `tree` as the node's
 `restoreCommand` / `splitRestoreCommand`.
+
+In fresh-shell or live mode, a command or `--none` is saved for a future rerun launch and the response
+names the active mode. `--clear` works in every mode. A pin never opts one session out of live mode.
 
 ```bash
 agtermctl session restore "claude --resume abc123" --target "$AGTERM_SESSION_ID"  # pin a shell line
@@ -130,8 +213,10 @@ agtermctl session new --cwd "$HOME/project" --no-select
 `session duplicate` creates a fresh session — a plain login shell — in the SAME workspace as the target,
 directly AFTER it, rooted at the target's focused-pane cwd, then selects + focuses it and prints the new
 id. ONLY the directory carries over: no custom name, `--command`, split, scratch, status, flag, font size,
-or background. It is `session new --cwd <source cwd> --after <source>` in one atomic round-trip, and the
-control half of the sidebar row's **Duplicate Session** context-menu item.
+or background. It is `session new --cwd <source cwd> --after <source>` in one atomic round-trip, except
+that a remote source's cwd goes through the local rule first (an existing local directory is kept,
+anything else becomes home), and the control half of the sidebar row's **Duplicate Session**
+context-menu item.
 
 ```bash
 agtermctl session duplicate                                    # a second shell beside the current session, same cwd
@@ -143,7 +228,8 @@ Read it back off `tree` — there is no new tree field: the duplicate's node app
 source, carrying the source's focused-pane cwd. That equals the source node's `tree.cwd` for a non-split
 session (and a split focused on its primary pane); for a split focused off its primary the source node's
 `tree.cwd` reports the primary while the duplicate carries the focused pane's directory, so compare against
-the pane you duplicated from.
+the pane you duplicated from; for a remote source the duplicate carries that cwd after the local rule, so
+it can read as home.
 
 ## Build a small layout
 
@@ -247,6 +333,30 @@ agtermctl session overlay open "make test" --target "$AGTERM_SESSION_ID"   # thi
 agtermctl session overlay result --json   # errors "still running" until it exits, then result.exitCode
 ```
 
+## Ask for a choice with an HTML page, and switch sessions from one
+
+A page is a richer `pick`: write the rows, open it with `--block`, and read the answer. The page needs no
+JavaScript; agterm handles the `data-agterm` tags.
+
+```bash
+page=$(mktemp /tmp/branchesXXXXXX)
+{
+  echo '<title>Pick a branch</title>'
+  git for-each-ref --format='%(refname:short)' refs/heads | while read -r b; do
+    esc=$(printf '%s' "$b" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/"/\&quot;/g')
+    printf '<form data-agterm="session.overlay.submit"><input type="hidden" name="value" value="%s"><button>%s</button></form>\n' "$esc" "$esc"
+  done
+} > "$page"
+if out=$(agtermctl session overlay open --html "$page" --block --target "$AGTERM_SESSION_ID" --follow); then
+  branch=$(printf '%s' "$out" | jq -r .value)
+fi
+rm -f "$page"
+```
+
+Exit 2 means the user closed the page without choosing. For a switcher that stays current, open a page with
+`--js` that builds its rows from `agterm.request('tree')` and switches with
+`agterm.request('session.select', {target: id})`; rows written into a no-JS page are a snapshot.
+
 ## Read what the user highlighted inside an overlay
 
 `session copy` and `session text` address the pane the overlay COVERS, so a selection the user made in
@@ -276,19 +386,20 @@ script that needs the selection some time after the fact.
 
 ## Cover only your own pane, leaving the user's other pane usable
 
-`--pane left|right` scopes the overlay to ONE split pane instead of the whole session. Your shell
-already knows which pane it runs in, so pass `$AGTERM_PANE` and the overlay lands over YOUR pane while
-the user keeps working in the sibling one:
+`--pane left|right` scopes the overlay to ONE split pane instead of the whole session. A newly spawned
+shell can pass `$AGTERM_PANE` so the overlay appears over its pane while the user keeps working in the
+sibling one:
 
 ```bash
 agtermctl session overlay open "revdiff HEAD~3" --target "$AGTERM_SESSION_ID" --pane "$AGTERM_PANE"
 ```
 
-This works unchanged on a NON-split session, which reports `AGTERM_PANE=left`, so there is no need to
-check the split state first. Two cases still need care: `$AGTERM_PANE` is `scratch` in the scratch
-terminal, which `--pane` rejects as a usage error, and a shell in the LEFT pane of a session whose split
-is hidden with the RIGHT pane focused reports `left` while only the right pane is on screen, so the open
-is refused with `pane not visible`. Handle both by falling back to a session-wide overlay on error.
+This works on a fresh non-split session, which reports `AGTERM_PANE=left`, so there is no need to check the
+split state first. Three cases still need care: `AGTERM_PANE` is a spawn role and may be stale after a pane
+promotion or `session swap`; it is `scratch` in the scratch terminal, which `--pane` rejects as a usage
+error; and a shell in the left pane of a session whose split is hidden with the right pane focused reports
+`left` while only the right pane is on screen, so the open is refused with `pane not visible`. Fall back to
+a session-wide overlay when the current role is uncertain or the pane-specific open fails.
 Left and right are independent — both may be open at once, each with its
 own `--background-color` — and a pane overlay is always full-pane, so `--size-percent` is rejected with
 it. `--wait`, `--block`, `--cwd` and `--follow` behave exactly as they do for a session-wide overlay;
@@ -341,7 +452,8 @@ Outside agterm (`AGTERM_ENABLED` unset) there is no overlay — fall back to `op
 
 A persistent backdrop behind the terminal grid (distinct from `show-image.sh`, which is a transient
 overlay). An image or rasterized-text watermark (auto-fitting the window, re-fitting on resize), or a
-solid terminal background color — per session, surviving a relaunch.
+solid terminal background color — per session, or per pane with `--pane`. The session default and left/right
+pane labels survive a relaunch; a scratch label ends with its scratch terminal.
 
 ```bash
 # rasterized text watermark on this session, faint
@@ -355,6 +467,11 @@ agtermctl session background color '#3a0d0d' --target "$AGTERM_SESSION_ID"
 
 # remove it
 agtermctl session background clear --target "$AGTERM_SESSION_ID"
+
+# label each agent of a two-agent split; a pane override wins over the session default
+agtermctl session background text "DRIVER" --opacity 0.12 --pane left --target "$AGTERM_SESSION_ID"
+agtermctl session background text "PEER" --opacity 0.12 --pane right --target "$AGTERM_SESSION_ID"
+agtermctl session background clear --pane right --target "$AGTERM_SESSION_ID"   # back to the default
 ```
 
 `--opacity` is 0.0–1.0; `--fit` is `contain` (default) / `cover` / `stretch` / `none`; `--position` is
@@ -380,22 +497,25 @@ and read it back — the twins of `session type`/`session text`, but always the 
 terminal (no `--target`/`--pane`).
 
 ```bash
-agtermctl quick show                                 # drop the overlay over whatever is active
-agtermctl quick type 'ls -la'$'\n'                   # inject keystrokes (\n runs it)
-echo "some payload" | agtermctl quick type --stdin   # pipe stdin in (e.g. a paste helper)
-agtermctl quick text --all                           # read its screen + scrollback back
-agtermctl tree | jq .quickVisible                    # is it open right now?
+agtermctl quick show                                    # drop the overlay over whatever is active
+agtermctl quick type 'ls -la'$'\n'                      # inject keystrokes (\n runs it)
+echo "some payload" | agtermctl quick type --stdin      # pipe stdin in (e.g. a paste helper)
+agtermctl quick text --all                              # read its screen + scrollback back
+agtermctl tree --json | jq '.result.tree.quickVisible'  # is it open right now?
 ```
 
 ## Flag a working set and view just the flagged sessions
 
-Flag a few sessions across workspaces, then flip the sidebar to the flat flagged list (each row labeled
-`session : workspace`). The flag is durable (persisted per session); `sidebar mode` is per-window.
+Flag a few sessions across workspaces, then flip the sidebar to the flagged view: one flat list with each
+row labeled `session : workspace`, or, under the tree layout, the flagged sessions nested under their
+workspace rows. The flag is durable (persisted per session); `sidebar mode` is per-window; the layout is
+app-wide.
 
 ```bash
 agtermctl session flag on --target "$AGTERM_SESSION_ID"   # flag this session
 agtermctl session flag on --target a1b2                   # flag another (any workspace)
 agtermctl sidebar mode flagged                            # show only the flagged sessions
+agtermctl sidebar flagged-layout tree                     # nest them under workspace rows, in every window
 agtermctl session go --to next                            # in flagged mode, nav steps the flagged set only
 agtermctl sidebar mode tree                               # back to the full tree
 agtermctl session flag clear                              # unflag everything in the window
@@ -455,8 +575,9 @@ member with the whole tree still on screen and applied ONCE with `workspace filt
 filter off` suspends it WITHOUT losing the set, so peeking at everything and coming back costs one call
 each way. Membership reads back per workspace as `focused`, the flag as the tree-level
 `workspaceFilter`, and a workspace row renders iff
-`sidebarVisible && sidebarMode == "tree" && (!workspaceFilter || focused)` — no workspace row renders at
-all with the sidebar hidden or in `flagged` mode (that view is a flat flagged-session list); in `tree`
+`sidebarVisible && ((sidebarMode == "tree" && (!workspaceFilter || focused)) || (sidebarMode == "flagged" &&
+sidebarFlaggedLayout == "tree" && one of its sessions is flagged))` — no workspace row renders at
+all with the sidebar hidden or under the flat flagged list, and the flagged tree ignores the filter; in `tree`
 mode with the filter off the whole tree is on screen regardless of membership, and only with the filter
 on does visibility narrow to the members. `filter on` with nothing marked is refused, so an applied
 filter always has a visible member and the pair can never disagree with what is on screen.
@@ -487,7 +608,8 @@ if [ "$was" = "true" ]; then agtermctl workspace filter on; fi
 
 Open every workspace at once, or collapse all but the current one (the same resolution as
 `--target active`, which stays expanded and scrolled into view) to cut clutter. Defaults to the frontmost window; pass
-`--window` to target any open window. A no-op in flagged mode.
+`--window` to target any open window. A no-op under the flat flagged list. In either tree layout both
+apply to all workspaces, including those the view omits.
 
 ```bash
 agtermctl sidebar expand                                 # expand every workspace (frontmost window)
@@ -539,6 +661,15 @@ printf 'deploy staging' | pbcopy
 agtermctl session paste --target "$other"   # lands at the prompt, not submitted
 ```
 
+`--pane` picks which pane it lands in, so multi-line text can reach a split or the scratch terminal
+without `session type` submitting it line by line:
+
+```bash
+pbcopy < notes.md
+agtermctl session paste --pane right --target "$other"
+agtermctl session text --pane right --target "$other" --json | jq -r '.result.text' | tail -3
+```
+
 ## Read a session's buffer as text
 
 `session text` returns the terminal buffer as plain text in `result.text` — the visible screen by
@@ -549,6 +680,7 @@ default, the whole scrollback with `--all`, or the last N lines with `--lines N`
 agtermctl session text                         # the visible screen of the focused pane
 agtermctl session text --lines 50              # the last 50 lines of the buffer
 agtermctl session text --pane right            # the split pane (errors if there is no split)
+agtermctl session text --pane-id "$AGTERM_PANE_ID" # this shell's terminal, even after a swap
 agtermctl session text --pane scratch --all    # the scratch terminal's full buffer, even while it's hidden
 # extract every URL from the full scrollback:
 agtermctl session text --all --json | jq -r '.result.text' | grep -oE 'https?://[^ ]+'
@@ -660,6 +792,11 @@ focus the tagged pane. An `active` tag is informational and preserves the curren
 `session go --to next-attention` only steps the selection; it does not move focus into the pane.
 Without `--pane` the status is treated as coming from the main (`left`) pane, so a block set from the split
 can be wiped by typing in the main pane and the reveal lands on the wrong surface.
+
+The tag also protects a block from the OTHER pane's agent: while the session is `blocked`, a status from a
+different pane that is not itself `blocked` is refused with `blocked status owned by pane <pane>`,
+so an agent reporting `active` after every tool call cannot erase its neighbour's request for input. With
+an agent in each pane, tag both or the second one's ordinary work looks like it comes from the first.
 
 ```bash
 # an agent working in the split pane; $AGT_PANE is set in a custom keymap command, else name it
@@ -847,6 +984,30 @@ agtermctl pick cancel "$pick_id" --window "$AGTERM_WINDOW_ID"
 Add `--follow` to raise a background target window when the picker opens. Without it, the picker waits in
 that window without stealing focus.
 
+## Require a yes/no answer in a cleanup hook
+
+A shell cleanup hook can require approval before removing `./build`. This example runs inside
+agterm and requires `jq`. Only an `answered` result with id `yes` reaches the removal:
+
+```bash
+#!/usr/bin/env bash
+answer=$(agtermctl ask "Remove ./build?" \
+  --message "Delete $PWD/build." \
+  --button yes=Delete --button no=Keep --default no --destructive yes \
+  --window "${AGTERM_WINDOW_ID:?run this hook inside agterm}" --follow \
+  --socket "${AGTERM_SOCKET:?run this hook inside agterm}") || exit 1
+
+printf '%s\n' "$answer" |
+  jq -e '.result == "answered" and .id == "yes"' >/dev/null || exit 1
+rm -rf -- ./build
+```
+
+Choosing Keep returns an answer with exit 0, so the id check is required. Esc and Command-W return
+`escaped` with exit 3; cancellation returns `cancelled` with exit 2. Both stop the hook.
+`ask` leaves the hook's stdin untouched. Omit `--target` to keep the question centered over its window's terminal area
+even when the hook's session is not selected. The default `--style terminal` uses the terminal theme;
+add `--style gui` for the picker's material appearance and native buttons. The hook's behavior is the same.
+
 ## Say what you are doing while the user waits
 
 `session hud` posts a passive panel over a session. The session keeps focus and stays typable under it, so
@@ -865,8 +1026,19 @@ choice=$(printf '%s\n' "$branches" | agtermctl pick --prompt "Check out which br
 agtermctl session hud close --target "$me"
 ```
 
+In a split, keep the panel inside the calling agent's pane and follow that shell if pane roles change:
+
+```bash
+agtermctl session hud "gathering options…" --spinner --position bottom-right \
+  --pane "$AGTERM_PANE" --pane-id "$AGTERM_PANE_ID" --target "$AGTERM_SESSION_ID"
+```
+
+The stable pane ID wins when it resolves. `--pane` is the fallback for older or unknown IDs. The selected
+pane supplies the size, 80% cap, anchor, and 10% edge margin. A hidden pane keeps its HUD and shows it again
+when restored; closing the pane closes its HUD.
+
 `session hud update` repaints in place, no re-spawn and no blink, and it replaces the whole spec: `--detail`,
-the spinner and `--text-color` are dropped unless repeated. `--spinner-style bar|braille|circle|blocks|dot` picks the look and
+the spinner, `--text-color`, `--pane`, and `--pane-id` are dropped unless repeated. `--spinner-style bar|braille|circle|blocks|dot` picks the look and
 turns the spinner on by itself (`dot` blinks instead of animating, for a panel up for minutes), and an
 update may switch style mid-flight; `--spinner-style none` stops it, which is also what a read-back's
 `none` echoes back to. `--position` anchors the panel to any of the nine
@@ -891,6 +1063,33 @@ shared with `session overlay open`, which means a second `session hud` replaces 
 `no overlay result: the slot holds a hud`. A HUD over
 a RUNNING program is refused instead: a message is replaceable, a program is not.
 
+### Keep a status board in a HUD
+
+A controller agent driving worker sessions can keep a short status board in a corner of its own session
+instead of printing it into its chat. Write the board to a file and post it with `--markdown`; `--font-size`
+keeps it small, and a later `update` replaces it in place:
+
+```bash
+cat > /tmp/status.md <<'EOF'
+## Workers
+- **api** refactor: tests green
+- **web** login page: waiting on review
+- **infra** migration: *blocked*, needs a token
+EOF
+
+agtermctl session hud --file /tmp/status.md --markdown --font-size 11 --position top-right \
+  --target "$AGTERM_SESSION_ID"
+
+# after rewriting the file
+agtermctl session hud update --file /tmp/status.md --markdown --position top-right \
+  --target "$AGTERM_SESSION_ID"
+```
+
+An update replaces the whole spec, so repeat `--markdown` and `--position`; the font stays what the panel
+opened with. A single newline inside a paragraph is a space, so keep entries as list items or end a line with
+two spaces. A board taller than the panel is clipped, its excess rows giving way to a dim `… N more`. The
+file is read once per command; nothing watches it, so push each change with an `update`.
+
 ## Navigate and manage windows
 
 ```bash
@@ -907,6 +1106,7 @@ agtermctl window zoom "$w"                 # maximize-to-screen toggle (call aga
 agtermctl window fullscreen "$w"           # native macOS full screen toggle (⌃⌘F / green button)
 agtermctl window minimize "$w" on          # park it in the Dock (off restores, toggle flips)
 agtermctl window select "$w"               # raise it, un-minimizing if it was parked
+agtermctl window go --to next              # raise the next OPEN window, wrapping (next|prev)
 ```
 
 `window new` returns only once the window is really on screen, so the `window resize` above works on the

@@ -26,6 +26,29 @@ struct ControlDispatcherOverlayTests {
         #expect(actions.calls.isEmpty)
     }
 
+    @Test(arguments: [(String?.none, "session.overlay.job.run requires a job id"), ("  ", "session.overlay.job.run requires a job id"),
+                      ("not-a-uuid", "invalid job id")])
+    func jobRunRejectsAMissingOrMalformedJobBeforeCallingActions(_ target: String?, _ error: String) async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(cmd: .sessionOverlayJobRun, target: target))
+
+        #expect(response == ControlResponse(ok: false, error: error))
+        #expect(actions.calls.isEmpty)
+    }
+
+    @Test func jobRunRoutesTheJobToTheHostsClaim() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        let job = UUID().uuidString
+
+        let response = await dispatcher.dispatch(ControlRequest(cmd: .sessionOverlayJobRun, target: job))
+
+        #expect(response == ControlResponse(ok: true, result: ControlResult(id: job)))
+        #expect(actions.calls == [.claimOverlayJob(job)])
+    }
+
     @Test func sessionOverlayOpenRoutesOptionsAndEchoesActionResponse() async {
         let actions = MockControlActions()
         let dispatcher = ControlDispatcher(actions: actions)
@@ -90,6 +113,45 @@ struct ControlDispatcherOverlayTests {
             .overlayClose(target: "session", window: "win", pane: nil),
             .overlayResult(target: "session", window: "win", pane: nil)
         ])
+    }
+
+    @Test func sessionOverlaySubmitRoutesValuePaneAndWindow() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let submit = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionOverlaySubmit, target: "session", args: ControlArgs(window: "win", pane: "right", value: "")))
+
+        #expect(submit == ControlResponse(ok: true))
+        #expect(actions.calls == [.overlaySubmit(target: "session", window: "win", pane: .right, value: "")])
+    }
+
+    @Test func sessionOverlaySubmitRefusesAMissingValueOrABadPane() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let missing = await dispatcher.dispatch(ControlRequest(cmd: .sessionOverlaySubmit, target: "session"))
+        let badPane = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionOverlaySubmit, target: "session", args: ControlArgs(pane: "middle", value: "x")))
+
+        #expect(missing == ControlResponse(ok: false, error: OverlayHtmlError.submitValue))
+        #expect(badPane?.ok == false)
+        #expect(actions.calls.isEmpty)
+    }
+
+    @Test func sessionOverlayResultWithAPageReadsThePageOutcome() async throws {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+        let id = UUID()
+
+        let page = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionOverlayResult, target: "session", args: ControlArgs(page: id.uuidString)))
+        let invalid = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionOverlayResult, args: ControlArgs(page: "not-a-uuid")))
+
+        #expect(page == ControlResponse(ok: true))
+        #expect(invalid == ControlResponse(ok: false, error: OverlayHtmlError.invalidPageID))
+        #expect(actions.calls == [.pageResult(id)])
     }
 
     @Test func sessionOverlayResultKeepsExactActionErrorResponse() async {
@@ -348,5 +410,132 @@ struct ControlDispatcherOverlayTests {
         #expect(negative == ControlResponse(ok: false, error: "--lines must be greater than 0"))
         #expect(extentAndPane == ControlResponse(ok: false, error: "use either --all or --lines, not both"))
         #expect(actions.calls.isEmpty)
+    }
+
+    @Test(arguments: [
+        (ControlArgs(command: "cat", html: "/tmp/r.html"), OverlayHtmlError.commandAndHtml),
+        (ControlArgs(wait: true, html: "/tmp/r.html"), OverlayHtmlError.waitWithHtml),
+        (ControlArgs(cwd: "/tmp/a", html: "/tmp/b/r.html"), "session.overlay.open: html file is outside cwd"),
+        (ControlArgs(cwd: "/tmp/r.html", html: "/tmp/r.html"), "session.overlay.open: cwd must be a directory containing the html file"),
+        (ControlArgs(html: "r.html"), "session.overlay.open: html file must be an absolute path"),
+        (ControlArgs(cwd: "/", html: "/tmp/r.html"), "session.overlay.open: cwd must not be / or the home directory"),
+        (ControlArgs(cwd: NSHomeDirectory(), html: NSHomeDirectory() + "/r.html"),
+         "session.overlay.open: cwd must not be / or the home directory"),
+        (ControlArgs(sizePercent: 50, pane: "left", html: "/tmp/r.html"), PaneOverlayError.sizePercentConflict),
+        (ControlArgs(command: "cat", navigation: true), OverlayHtmlError.navigationWithoutPage),
+        (ControlArgs(command: "cat", javascript: true), OverlayHtmlError.javascriptWithoutPage),
+        (ControlArgs(html: "/tmp/r.html", url: "http://localhost:5173/"), OverlayHtmlError.htmlAndURL),
+        (ControlArgs(command: "cat", url: "http://localhost:5173/"), OverlayHtmlError.commandAndURL),
+        (ControlArgs(wait: true, url: "http://localhost:5173/"), OverlayHtmlError.waitWithURL),
+        (ControlArgs(cwd: "/tmp", url: "http://localhost:5173/"), OverlayHtmlError.cwdWithURL),
+        (ControlArgs(url: "ftp://example.com/"), OverlayHtmlError.invalidURL),
+        (ControlArgs(url: "localhost:5173"), OverlayHtmlError.invalidURL),
+    ])
+    func htmlOpenRejectsInvalidInputsBeforeCallingActions(_ args: ControlArgs, _ error: String) async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(cmd: .sessionOverlayOpen, target: "session", args: args))
+
+        #expect(response == ControlResponse(ok: false, error: error))
+        #expect(actions.calls.isEmpty)
+    }
+
+    @Test func htmlOpenRoutesThePageAndItsGrant() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        _ = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionOverlayOpen, target: "session",
+            args: ControlArgs(cwd: "/tmp", follow: true, pane: "right", color: "#102030", html: "/tmp/a/r.html",
+                              navigation: true, javascript: true)
+        ))
+
+        #expect(actions.calls == [
+            .overlayOpen(target: "session", window: nil,
+                         ControlSessionOverlayOpenOptions(command: "", cwd: nil, wait: false, sizePercent: nil,
+                                                          backgroundColor: "#102030", follow: true, pane: .right,
+                                                          page: .file(path: "/tmp/a/r.html", grantRoot: "/tmp"),
+                                                          navigation: true, javascript: true))
+        ])
+    }
+
+    @Test(arguments: [Bool?.none, true])
+    func urlOpenRoutesTheWebPageWithItsToolbar(_ javascript: Bool?) async throws {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        _ = await dispatcher.dispatch(ControlRequest(
+            cmd: .sessionOverlayOpen, target: "session",
+            args: ControlArgs(sizePercent: 60, navigation: true, url: "http://localhost:5173/app", javascript: javascript)
+        ))
+
+        #expect(actions.calls == [
+            .overlayOpen(target: "session", window: nil,
+                         ControlSessionOverlayOpenOptions(command: "", cwd: nil, wait: false, sizePercent: 60,
+                                                          backgroundColor: nil,
+                                                          page: .url(try #require(URL(string: "http://localhost:5173/app"))),
+                                                          navigation: true, javascript: javascript == true))
+        ])
+    }
+
+    @Test func reloadRoutesThePaneAndRejectsABadOne() async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let bad = await dispatcher.dispatch(ControlRequest(cmd: .sessionOverlayReload, target: "session",
+                                                           args: ControlArgs(pane: "middle")))
+        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionOverlayReload, target: "session",
+                                                     args: ControlArgs(window: "win", pane: "split")))
+
+        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionOverlayReload, target: "session",
+                                                     args: ControlArgs(current: true)))
+
+        #expect(bad == ControlResponse(ok: false, error: PaneOverlayError.invalidPane))
+        #expect(actions.calls == [.overlayReload(target: "session", window: "win", pane: .right, current: false),
+                                  .overlayReload(target: "session", window: nil, pane: nil, current: true)])
+    }
+
+    @Test(arguments: [("back", HtmlNavigation.back), ("forward", .forward), ("browser", .browser), ("finder", .finder)])
+    func navigateRoutesTheStepAndPane(_ name: String, _ navigation: HtmlNavigation) async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        _ = await dispatcher.dispatch(ControlRequest(cmd: .sessionOverlayNavigate, target: "session",
+                                                     args: ControlArgs(pane: "left", to: name)))
+
+        #expect(actions.calls == [.overlayNavigate(target: "session", window: nil, pane: .left, navigation)])
+    }
+
+    @Test(arguments: [(String?.none, OverlayHtmlError.navigation), ("up", OverlayHtmlError.navigation), ("copy", OverlayHtmlError.navigation)])
+    func navigateRejectsAMissingOrUnknownStep(_ name: String?, _ error: String) async {
+        let actions = MockControlActions()
+        let dispatcher = ControlDispatcher(actions: actions)
+
+        let response = await dispatcher.dispatch(ControlRequest(cmd: .sessionOverlayNavigate, target: "session",
+                                                                args: ControlArgs(to: name)))
+
+        #expect(response == ControlResponse(ok: false, error: error))
+        #expect(actions.calls.isEmpty)
+    }
+
+    @Test(arguments: [
+        (HtmlOverlayOpenFailure.unknownSession, OverlayPane?.none, "no such session"),
+        (.alreadyOpen, nil, "overlay already open"),
+        (.alreadyOpen, .left, PaneOverlayError.alreadyOpen),
+        (.paneNotVisible, .right, PaneOverlayError.paneNotVisible),
+        (.presenter, nil, OverlayHtmlError.presenter),
+    ])
+    func openFailuresMapToTheirMessages(_ failure: HtmlOverlayOpenFailure, _ pane: OverlayPane?, _ message: String) {
+        #expect(failure.message(pane: pane) == message)
+    }
+
+    @Test(arguments: [
+        (HtmlOverlayCommandFailure.unknownSession, "no such session"),
+        (.noOverlay, OverlayHtmlError.noOverlay),
+        (.notHtml, OverlayHtmlError.notHtml),
+    ])
+    func commandFailuresMapToTheirMessages(_ failure: HtmlOverlayCommandFailure, _ message: String) {
+        #expect(failure.message == message)
     }
 }

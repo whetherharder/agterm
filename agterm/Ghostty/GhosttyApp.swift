@@ -20,12 +20,21 @@ final class GhosttyApp {
     /// libghostty attributes none to a file. `reloadConfig` surfaces it for the Reload Config /
     /// `config.reload` warning; the Console log names the offending line.
     private(set) var lastConfigDiagnosticsCount = 0
+    /// What the launch's Live sessions reset did, recorded before any window mounts and posted from the
+    /// window task once notifications are registered; nil when no marker was consumed.
+    private(set) var liveResetOutcome: LiveReset.Outcome?
+
+    func recordLiveResetOutcome(_ outcome: LiveReset.Outcome) {
+        liveResetOutcome = outcome
+    }
     /// Terminal background from the resolved config; tints the window so the title bar blends with the
     /// terminal instead of the default titlebar material. Nil when unread.
     private(set) var terminalBackgroundColor: NSColor?
     /// Terminal foreground from the resolved config. The chrome (sidebar rows, title-bar text + buttons) uses
     /// it so non-terminal text tracks the theme, not the system label color. Nil when unread.
     private(set) var terminalForegroundColor: NSColor?
+    /// terminalPalette is the 16 ANSI colors of the resolved config as `#rrggbb`, by slot; empty when unread.
+    private(set) var terminalPalette: [String] = []
     /// Whether the active theme reads as dark, by perceived luminance of the WASHED sidebar background (theme
     /// background plus sidebar-tint wash) — the color the disclosure triangle sits on, so a strong tint pushing
     /// a near-threshold theme past the midpoint still classifies right. Pins AppKit-drawn chrome to the theme,
@@ -55,14 +64,22 @@ final class GhosttyApp {
     /// Whether the sidebar draws the red unseen-notification count badge. The sidebar Coordinator reads it
     /// (gating the count to 0 when off); settings-mirrored like `toolbarMode`.
     private(set) var notificationBadgeEnabled: Bool = true
+    /// Which keystroke clears a blocked or completed glyph; read at keystroke time by the surface factories'
+    /// status-clear closure. Settings-mirrored like `toolbarMode`.
+    private(set) var statusReset: StatusReset = .firstKey
     /// Whether a click anywhere on a sidebar workspace row toggles its expansion; on by default. The sidebar
     /// Coordinator reads it in `handleSingleClick`, and the disclosure triangle ignores it because AppKit
     /// toggles that natively. Settings-mirrored like `toolbarMode`.
     private(set) var workspaceRowClickExpands: Bool = true
-    /// Whether a restored pane re-runs its last clean-quit foreground command; the surface factories read it to
-    /// decide whether to feed that command as `initial_input`. Affects only the next restore — no live
-    /// re-render notification.
-    private(set) var restoreRunningCommand: Bool = false
+    /// The persisted choice and effective mode frozen before the first surface. An ineligible live request
+    /// falls back to fresh shells without releasing its daemon claims. Settings changes never mutate either
+    /// latch, so later sessions, reap, and reopened windows use the same launch policy.
+    let restoreLaunchDecision: RestoreLaunchDecision
+    var requestedRestoreMode: RestoreMode { restoreLaunchDecision.requested }
+    var launchRestoreMode: RestoreMode { restoreLaunchDecision.active }
+    var liveRestoreUnavailableReason: String? { restoreLaunchDecision.liveUnavailableReason }
+    var restoreRunningCommand: Bool { launchRestoreMode == .rerun }
+    static func capturesForegroundOnExit(mode: RestoreMode) -> Bool { mode == .rerun || mode == .live }
     /// Whether the window title bar shows the attention bell icon; off by default. The title bar reads it via
     /// `WindowContentView`'s mirrored chrome state; settings-mirrored like `toolbarMode`.
     private(set) var attentionButtonEnabled: Bool = false
@@ -72,6 +89,9 @@ final class GhosttyApp {
     /// Whether only the frontmost window shows its sidebar, collapsing every other open window's; off by
     /// default. `WindowAccessor.reportFrontmost` reads it per frontmost change to gate the `WindowLibrary`.
     private(set) var autoHideSidebarInactiveWindows: Bool = false
+    /// How every window's flagged sidebar view arranges its sessions; the sidebar Coordinator reads it per
+    /// rebuild and on `.agtermAppearanceChanged`.
+    private(set) var flaggedViewLayout: FlaggedViewLayout = .flat
     /// Program basenames NOT to re-run on restore: the parsed user-editable `restore-denylist.conf` (seeded
     /// with the terminal multiplexers), read at launch only; consulted via `CommandRestore.shouldRestore`.
     private(set) var restoreDenylist: Set<String> = []
@@ -112,12 +132,22 @@ final class GhosttyApp {
     private var resourcesDir: String?
 
     private init() {
-        resolveResources()
-        guard ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv) == GHOSTTY_SUCCESS else {
+        let resolvedResources = Self.resolveResources()
+        let initialSettings = Self.settingsStore().load()
+        let restoreDecision = initialSettings.effectiveRestoreMode.launchDecision(
+            liveUnavailableReason: ZmxLaunch.liveUnavailableReason())
+        restoreLaunchDecision = restoreDecision
+        resourcesDir = resolvedResources
+        let booted = ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv) == GHOSTTY_SUCCESS
+        // libghostty adopts the user's numeric locale; CoreSVG mis-sizes symbols with decimal commas.
+        // reset before the first symbol lookup, which caches its geometry. ensureLocale runs inside
+        // ghostty_init ahead of its own fallible steps, so a failed init can leave the locale adopted.
+        setlocale(LC_NUMERIC, "C")
+        guard booted else {
             logger.error("ghostty_init failed")
             return
         }
-        let configInputs = Self.resolveConfigInputs()
+        let configInputs = Self.resolveConfigInputs(settings: initialSettings)
         guard let cfg = loadConfig(configInputs) else {
             logger.error("ghostty_config_new failed")
             return
@@ -199,12 +229,12 @@ final class GhosttyApp {
         workspaceRowClickExpands = enabled
     }
 
-    func setRestoreRunningCommand(_ enabled: Bool) {
-        restoreRunningCommand = enabled
-    }
-
     func setAttentionButtonEnabled(_ enabled: Bool) {
         attentionButtonEnabled = enabled
+    }
+
+    func setStatusReset(_ mode: StatusReset) {
+        statusReset = mode
     }
 
     func setHiddenInterfaceElements(_ elements: Set<InterfaceElement>) {
@@ -213,6 +243,10 @@ final class GhosttyApp {
 
     func setAutoHideSidebarInactiveWindows(_ enabled: Bool) {
         autoHideSidebarInactiveWindows = enabled
+    }
+
+    func setFlaggedViewLayout(_ layout: FlaggedViewLayout) {
+        flaggedViewLayout = layout
     }
 
     func setRestoreDenylist(_ denylist: Set<String>) {
@@ -317,7 +351,10 @@ final class GhosttyApp {
     }
 
     static func resolveConfigInputs() -> ConfigInputs {
-        let settings = settingsStore().load()
+        resolveConfigInputs(settings: settingsStore().load())
+    }
+
+    private static func resolveConfigInputs(settings: AppSettings) -> ConfigInputs {
         let configDir = ConfigPaths.configDirectory(
             setting: settings.configDirectory,
             stateDir: ProcessInfo.processInfo.environment["AGTERM_STATE_DIR"],
@@ -367,10 +404,11 @@ final class GhosttyApp {
         // theme change. The selection colors re-side from the passed-in `isDark`, never re-read from a view.
         resolveThemeColors(from: derivedConfig ?? newConfig, inputs: inputs, isDark: isDark)
         if let derivedConfig { ghostty_config_free(derivedConfig) }
-        // the broadcast pushes the shared config (no background image, default font size) to every surface,
-        // wiping per-surface watermarks and zoom — re-assert them after. No-op without either; on the
-        // zoom-clearing reload paths the per-session fontSize was already nil'd, so only watermarks re-apply.
-        for surface in surfaces { surface.reapplySessionConfigIfNeeded() }
+        // restore per-surface overrides after the shared config broadcast
+        for surface in surfaces {
+            surface.reapplySessionConfigIfNeeded()
+            if let staticTitle, surface.session != nil { surface.applyTitle(staticTitle) }
+        }
         return lastConfigDiagnosticsCount
     }
 
@@ -384,6 +422,7 @@ final class GhosttyApp {
         lastConfigInputs = inputs
         terminalBackgroundColor = Self.color(from: config, key: "background")
         terminalForegroundColor = Self.color(from: config, key: "foreground")
+        terminalPalette = Self.palette(from: config)
         refreshSelectionColors(isDark: isDark)
     }
 
@@ -545,6 +584,29 @@ final class GhosttyApp {
         try? FileManager.default.removeItem(atPath: tmp)
     }
 
+    /// The static `title` of the user's config, nil when unset. libghostty drops EVERY OSC title while that
+    /// key is set, the role reports a pane's zmx client sends as titles included, and the daemon enforces a
+    /// role the app would then never learn. So the key is cleared in every config build and agterm applies
+    /// it instead: to a pane when it is built, in place of each title a program sets, and on a reload.
+    private(set) var staticTitle: String?
+
+    private func clearStaticTitle(_ cfg: ghostty_config_t) {
+        let key = "title"
+        var value: UnsafePointer<CChar>?
+        let read = key.withCString { ghostty_config_get(cfg, &value, $0, UInt(key.utf8.count)) }
+        staticTitle = read ? value.map { String(cString: $0) }.flatMap { $0.isEmpty ? nil : $0 } : nil
+        guard staticTitle != nil else { return }
+        let tmp = (NSTemporaryDirectory() as NSString).appendingPathComponent("agterm-title-\(UUID().uuidString).conf")
+        do {
+            try "title =\n".write(toFile: tmp, atomically: true, encoding: .utf8)
+        } catch {
+            logger.warning("title override write failed: \(error.localizedDescription, privacy: .public)")
+            return
+        }
+        tmp.withCString { ghostty_config_load_file(cfg, $0) }
+        try? FileManager.default.removeItem(atPath: tmp)
+    }
+
     private func loadConfig(_ inputs: ConfigInputs, extraOverlayPath: String? = nil) -> ghostty_config_t? {
         guard let cfg = ghostty_config_new() else { return nil }
 
@@ -588,6 +650,7 @@ final class GhosttyApp {
 
         ghostty_config_load_recursive_files(cfg)
         forceUnsupportedShellFeaturesOff(cfg)
+        clearStaticTitle(cfg)
         ghostty_config_finalize(cfg)
 
         let diagCount = ghostty_config_diagnostics_count(cfg)
@@ -599,6 +662,15 @@ final class GhosttyApp {
             }
         }
         return cfg
+    }
+
+    private static func palette(from config: ghostty_config_t) -> [String] {
+        var palette = ghostty_config_palette_s()
+        let key = "palette"
+        guard key.withCString({ ghostty_config_get(config, &palette, $0, UInt(key.utf8.count)) }) else { return [] }
+        return withUnsafeBytes(of: palette.colors) { raw in
+            raw.bindMemory(to: ghostty_config_color_s.self).prefix(16).map { String(format: "#%02x%02x%02x", $0.r, $0.g, $0.b) }
+        }
     }
 
     /// A named color key (e.g. `background`, `foreground`) from the resolved config as an opaque `NSColor`,
@@ -628,7 +700,7 @@ final class GhosttyApp {
         return paths
     }()
 
-    private func resolveResources() {
+    private static func resolveResources() -> String? {
         // resolve from our own candidates (bundle first), ignoring any inherited GHOSTTY_RESOURCES_DIR: a stale
         // one shadows our complete bundle and leaves libghostty deriving a broken TERMINFO. TERMINFO itself is
         // never set here — libghostty overwrites it at shell spawn with dirname(GHOSTTY_RESOURCES_DIR)/terminfo,
@@ -639,10 +711,10 @@ final class GhosttyApp {
         )
         guard let dir = resolver.resolve() else {
             unsetenv("GHOSTTY_RESOURCES_DIR")
-            return
+            return nil
         }
-        resourcesDir = dir
         setenv("GHOSTTY_RESOURCES_DIR", dir, 1)
+        return dir
     }
 }
 
@@ -689,4 +761,6 @@ extension Notification.Name {
     /// and the action palette re-reads the custom commands. The data-driven menu shortcuts re-render on their
     /// own from the `@Observable` keymap.
     static let agtermKeymapChanged = Notification.Name("agterm.keymapChanged")
+    /// Posted after `hooks.conf` is (re)loaded and reparsed, so the hook scheduler applies the new definitions.
+    static let agtermHooksChanged = Notification.Name("agterm.hooksChanged")
 }

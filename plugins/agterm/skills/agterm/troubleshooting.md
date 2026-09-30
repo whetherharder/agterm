@@ -34,8 +34,10 @@ You are inside agterm (`AGTERM_ENABLED=1`). Use:
   `ssh-env` and `ssh-terminfo` for `shell-integration-features`. Ghostty implements them by replacing
   `ssh` with a wrapper calling a `ghostty` CLI absent from agterm's bundle, so agterm forces both off
   after reading the config and keeps every other flag. Setting either is by design a no-op, reports no
-  diagnostic, and is NOT a bug. For remote terminfo, install the entry manually with
-  `infocmp -x xterm-ghostty | ssh <host> 'tic -x -'`.
+  diagnostic, and is NOT a bug. For remote terminfo, install the entry once per host and account with
+  `agtermctl terminfo install <host>` (local-only, no socket; `-p`, `-i`, `-J`, `-F` pass through, other
+  connection settings belong in `~/.ssh/config`, and the execution settings are the installer's own). The symptom it fixes is `less`, `vim` or `apt` on the remote
+  warning that the terminal is not fully functional, because `TERM=xterm-ghostty` is unknown there.
 - **Logs** (unified logging, subsystem `com.umputun.agterm`):
   ```bash
   log show --predicate 'subsystem == "com.umputun.agterm"' --info --last 30m
@@ -59,8 +61,9 @@ also no-ops with no session selected or an overlay already open.
 
 Causes, in order: a parse error (see the diagnostics); the chord conflicts with a built-in or another
 custom command and was dropped to palette-only (it still runs from `⌃⇧P`, tagged `custom`); a reserved
-chord (`ctrl+tab`, `ctrl+1`/`ctrl+2`); a modifier-less key (rejected — a custom chord needs a
-modifier); it does not fire while a text field (inline rename, a palette, Settings) has keyboard focus,
+chord (`ctrl+tab`, `ctrl+1`/`ctrl+2`); a first chord without a modifier or function key
+(`f1` through `f20`); it does not fire while a text field (inline rename, a palette, Settings)
+has keyboard focus,
 though it DOES fire from a terminal pane or an empty window (every session closed); it runs in a non-interactive
 `/bin/sh -c` (no aliases/functions, a smaller `PATH` — use absolute paths or `$SHELL -lc '…'`); a
 non-zero exit posts a failure banner (meaning it DID fire and failed). Reload after edits:
@@ -103,14 +106,77 @@ To remap a shortcut ghostty still owns: a physical key name (`key_c`, `key_v`, �
 any layout; a bare letter (`c`, `v`) matches the produced character. Edit `~/.config/agterm/ghostty.conf`,
 then `agtermctl config reload`.
 
+### "My live session came back as a fresh shell"
+
+Check these in order:
+
+- **Restart after selecting Live sessions.** The restore mode is fixed when agterm starts. Changing
+  **Settings ▸ General ▸ Restore sessions** affects the next process, not sessions already open.
+- **Read the eligibility reason in Settings.** Live mode requires zsh as the macOS login shell and the
+  bundled zmx and zsh-integration resources. If the launch cannot use live mode, every pane starts as an
+  ordinary shell.
+- **Inspect actual backing with `tree --json`.** Primary and split surfaces report `backedByZmx`; the session
+  field is true only when every existing primary or split is backed. The sidebar deliberately has no zmx
+  indicator.
+- **Confirm the pane is in scope.** Primary and split panes can survive. Scratch, overlay, and quick terminals
+  are temporary by design.
+- **Start from `agtermctl zmx list`.** It reports every daemon and the pane claiming it, with the
+  restore mode as a header. `claimed` with zero clients is a CLOSED window's resting state, not a leak;
+  `orphan` is what `zmx prune` takes. `unknown` means the pane inventory was incomplete, so nothing
+  can be pruned until that is resolved.
+- **A missing daemon is recreated, running the captured command.** A reboot or a stale daemon leaves nothing
+  to attach, so agterm creates one under the saved name and replays the command that pane was running at the
+  last clean quit. A fresh shell instead means no capture applied: the window was closed before the quit, the
+  machine lost power or was force-quit, the process exited before quitting, SIGTERM was used, or the command
+  is refused by `restore-denylist.conf`. `agtermctl zmx kill` is not one of these — it closes a shown split
+  or promotes a primary rather than leaving a daemon to recreate. To check what was captured, read
+  `foregroundCommand` in `windows/<id>.json` while agterm is STOPPED: the next launch moves it into memory
+  and rewrites the file with nil, so a running app always shows null there.
+- **A tool asks for the microphone again after every update.** The pane was created before the session
+  host and reads `orphaned` in `agtermctl tree --json`, so macOS charges each tool version separately. Agterm ▸
+  Reset Live Sessions… (or `agtermctl zmx reset --force`) ends those sessions' processes at the next launch
+  and recreates them under the host; agterm quits and reopens itself, captured commands start again where
+  possible, and the notification afterwards says how many sessions were covered. A session whose old process
+  could not be confirmed gone gets no command restarted and the reset can be run again.
+- **After an update, an attached session still needs a key press, or a zmx change seems missing.** A live
+  session keeps the zmx it was created with through app updates. `agtermctl zmx list` marks such rows
+  `outdated`; Agterm ▸ Reset Live Sessions… (or `agtermctl zmx reset --force`) recreates them on the current
+  zmx, with the same cost as any reset: running work stops and agent conversations need resuming.
+- **Switching modes ends detached live processes.** Selecting Fresh shells or Re-run commands and restarting
+  reaps the live daemons in this state directory. An unavailable launch that still requests Live sessions
+  preserves its claimed daemons for a later eligible launch.
+
+SIGTERM to agterm should leave a backed pane's daemon and process alive for the next launch. Explicitly
+deleting its session, workspace, split, or window kills it after any undo grace period.
+
+A reattached screen can look slightly different without being a fresh shell. Usable text, TUI state, and
+normal colors survive, but inline images, earlier OSC 133 prompt markers, program-changed palette entries,
+and hyperlink metadata already attached to cells do not. New output behaves normally.
+
+Saving settings with this version removes the legacy `restoreRunningCommand` key. If an older agterm opens
+the same state directory later, it sees no restore setting and defaults to fresh shells.
+
+### "`tree` shows `(not realized)` right after a launch that replays commands"
+
+That is pacing, not a fault. A launch that replays commands starts each window's visible panes at once,
+then the remaining replaying panes one at a time, a short interval apart, so tens of programs do not boot
+in the same instant. A session whose MAIN
+pane is waiting its turn reads `(not realized)` in `tree` and `realized: false` in `tree --json` until its
+turn comes; a queued right pane shows no tag, since `realized` describes the main pane only, so a tree with
+no tags is not proof the launch has finished. While a pane waits for its permit, its captured command stays
+on the session.
+Selecting it, or a command that must act on it (`session type`, `session search`, `session paste`,
+`session selectall`, `font inc`/`dec`/`reset`), brings it up at once; reads such as `session text` and
+`session copy` answer `session not realized` and leave it queued. A main pane still `(not realized)` long
+after its neighbours came up is a different fault, not pacing.
+
 ### "My session restore override didn't fire"
 
 You set `session restore` but the pane came back as a plain shell (or re-ran the old captured command).
 Check, in order:
 
-- **The "Restore running commands on restart" setting is off.** The override obeys the same master switch
-  as the rest of restore; a `set`/`--none` while it is off succeeds but nothing runs on relaunch (the
-  response says so in `result.text`). Turn it on in General settings.
+- **The launch is not in `rerun` mode.** A `set`/`--none` still saves policy, and `result.text` names the
+  active mode. Select Re-run commands in General settings and restart agterm.
 - **The pane resolved to the scratch, or you pinned `--pane right` on a session with no split.** Both are
   rejected at set time (`the scratch terminal is never restored` / `session has no split`), so nothing was
   pinned — re-read the command's output.
@@ -119,10 +185,8 @@ Check, in order:
 - **It already fired once this launch.** The override is consumed once per launch: after it runs, a second
   surface for the same pane in the SAME session (e.g. opening a fresh split with ⌘D) gets a plain shell. It
   is still pinned — `tree` reports `restoreCommand` — and fires again on the NEXT restart.
-- **The split was hidden at quit.** A hidden split is not restored at all, so its override describes a pane
-  that no longer exists: the pin is DROPPED on that launch (`tree` stops reporting `splitRestoreCommand`)
-  rather than left to fire into a later manual ⌘D split. Show the split before quitting, and re-pin after a
-  launch that dropped it.
+- **The split is still hidden.** Its identity and pin survive restart, but the surface is created only when
+  the split is shown; the saved rerun policy applies then.
 - **You reopened a closed session or a closed window, not relaunched the app.** The override fires only on
   an app-launch restore — Reopen Closed Item and reopening a closed window deliberately do NOT arm it. Quit
   and relaunch agterm to see it fire.
@@ -149,17 +213,30 @@ posted and the suppressed case under the `NotificationManager` category.
 
 Programs run in a session request Automation, Camera, Microphone, Contacts, Calendars, Reminders, Photos,
 Location, Bluetooth, local network, speech recognition, system administration and system audio recording
-THROUGH agterm: macOS treats agterm as the responsible app, so the prompt names agterm and the answer is
-recorded against agterm, not the tool. One grant then covers every program in every session with no
-further prompt, and a dismissed prompt is never re-offered (`osascript` keeps returning "Not authorized
-to send Apple events"). The user changes the answer in System Settings ▸ Privacy & Security under the
-matching service, e.g. Automation ▸ agterm. This is macOS policy, not an agterm bug: do not file it.
+through agterm while macOS attributes them to it. The prompt names agterm and the answer applies to
+programs with that attribution. A dismissed prompt is never re-offered (`osascript` keeps returning
+"Not authorized to send Apple events"). The user changes the answer in System Settings ▸ Privacy & Security
+under the matching service, for example Automation ▸ agterm. This is macOS policy, not an agterm bug: do not file it.
+
+### "a permission is granted but a tool still cannot use it"
+
+A service shows agterm enabled in System Settings, yet a tool in a session is denied. One cause is a stale
+grant: macOS stores each grant with a code requirement, and a grant made while agterm was signed ad-hoc
+requires a bare code hash, so a rebuilt or reinstalled agterm no longer matches while the toggle still reads
+on. Confirm it before concluding anything: save the row's raw `csreq` blob from the system TCC.db to a
+file, the bytes rather than sqlite's printed output (`SELECT writefile('/tmp/ax.csreq', csreq) FROM access
+WHERE service='kTCCServiceAccessibility' AND client='com.umputun.agterm'`), then run
+`codesign --verify -R /tmp/ax.csreq /Applications/agterm.app`. Only `code failed to satisfy specified code
+requirement(s)` is the stale grant; an extraction, parsing, or signature error needs resolving first. The
+[stale-grant diagnosis](https://github.com/umputun/agterm/blob/master/docs/troubleshooting.md#an-accessibility-permission-you-granted-stops-working-after-an-update)
+in docs covers the `tccutil reset` and the re-grant. A confirmed stale requirement is a machine-state issue,
+not an agterm bug: do not file it. A denial with a requirement that does match needs a different diagnosis.
 
 ### "a command cannot read ~/Downloads, ~/Desktop or ~/Documents"
 
 macOS protects those folders, plus removable and network volumes, on its own: a separate mechanism from the
 services above, gated by no entitlement, and agterm is not sandboxed. The per-folder usage-description
-strings are optional and agterm ships none, so the prompt carries macOS's own wording. The answer is
+strings are optional and agterm ships one for each, so the prompt carries agterm's wording. The answer is
 recorded against the app macOS holds responsible, so another terminal listing the folder proves nothing
 about agterm. The user grants it in System Settings ▸ Privacy & Security ▸ Files & Folders ▸ agterm, or
 gives agterm Full Disk Access, which covers all of them at once. A dismissed prompt is never re-offered.
@@ -167,6 +244,14 @@ gives agterm Full Disk Access, which covers all of them at once. A dismissed pro
 not permitted` for the privacy denial, `Permission denied` for ordinary permission bits, and some `ls`
 replacements print the same wording for both. Needing the grant is macOS policy, not an agterm bug: do not
 file it.
+
+### "agterm would like to access data from other apps, over and over"
+
+Use `agtermctl tree --json` to read `liveAttribution` and `splitLiveAttribution`; see the
+[tree field definitions](reference.md#tree). The [App Data diagnosis](https://github.com/umputun/agterm/blob/master/docs/troubleshooting.md#agterm-would-like-to-access-data-from-other-apps-keeps-coming-back)
+covers the permission guidance: which panes keep agterm's attribution after a relaunch, and Full Disk
+Access for `orphaned` and `app` panes. Needing the consent grant is macOS policy: do not file the consent
+prompt itself as an agterm bug.
 
 ### "The agent-status glyph does not update"
 
@@ -207,6 +292,17 @@ mishandles it. agterm emits correct paired focus-in/focus-out and is already mac
 refocus click is not forwarded into the pty), so the terminal is not at fault. Tracked as
 anthropics/claude-code#72188 (mouse-click variant #72273). Workaround: answer before switching away, or
 `Esc` the stuck prompt and let it re-ask.
+
+### "Claude Code prints links as `label (url)` instead of clickable labels"
+
+Detection, not rendering. agterm identifies as `TERM_PROGRAM=agterm` (see the env list in SKILL.md) and
+Claude Code's hyperlink allowlist lacks that name, so it prints the URL. agterm renders OSC 8 links fine.
+Workaround: `FORCE_HYPERLINK=1 claude` (Claude Code reads it before any terminal check), or
+`env = FORCE_HYPERLINK=1` in `~/.config/agterm/ghostty.conf` for every new shell, after a config reload
+(`agtermctl config reload` or File ▸ Reload Config) and a new session; that form also forces links into
+redirected output. `env = TERM_PROGRAM=ghostty` there does nothing: agterm applies its identity after the
+config file. Do not file an agterm issue for it; the fix belongs upstream (Claude Code recognizing `agterm`
+or `TERM=xterm-ghostty`).
 
 ### "Every session restores to the directory it was created in"
 

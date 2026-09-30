@@ -8,6 +8,11 @@ import XCTest
 /// assert against the response and the `workspaces.json` file-polling oracle the sidebar tests use.
 @MainActor
 final class ControlAPIUITests: ControlAPITestCase {
+    override func setUp() async throws {
+        if name.contains("testSessionSwap") { executionTimeAllowance = 35 }
+        try await super.setUp()
+    }
+
     func testTreeReturnsSeededWorkspaceAndSession() throws {
         let response = try sendCommand(#"{"cmd":"tree"}"#)
         XCTAssertEqual(response["ok"] as? Bool, true, "tree should succeed: \(response)")
@@ -65,6 +70,49 @@ final class ControlAPIUITests: ControlAPITestCase {
             RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         }
         XCTAssertEqual(fg, ["tee", marker], "tree should expose the session's live foreground command")
+    }
+
+    // the idle direction of the same real prompt/pty/sysctl path: a pane at its prompt names its shell, and
+    // the name goes away the moment a program takes the foreground. Pins `running` -> `buildTree` -> wire:
+    // a tree that dropped the idle case reports null here while every host-free test stays green.
+    func testTreeNamesTheForegroundShellAndDropsItWhenAProgramRuns() throws {
+        var shell: String?
+        for _ in 0..<40 {
+            let resp = try sendCommand(#"{"cmd":"tree"}"#)
+            if let name = firstSessionNode(resp)?["foregroundShell"] as? String {
+                XCTAssertNil(firstSessionNode(resp)?["foreground"], "foregroundShell and foreground are exclusive")
+                shell = name
+                break
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        }
+        let idle = try XCTUnwrap(shell, "a pane sitting at its prompt should name its shell")
+        XCTAssertFalse(idle.hasPrefix("-"), "the login dash must be stripped before the basename: got \(idle)")
+
+        let marker = markerDir.appendingPathComponent("idlefg-\(UUID().uuidString)").path
+        let payload: [String: Any] = ["cmd": "session.type", "args": ["text": "tee \(marker)\n"]]
+        let line = String(data: try JSONSerialization.data(withJSONObject: payload), encoding: .utf8)!
+        XCTAssertEqual(try sendCommand(line)["ok"] as? Bool, true, "session.type should succeed")
+
+        var ranWithoutShell = false
+        for _ in 0..<40 {
+            let resp = try sendCommand(#"{"cmd":"tree"}"#)
+            if let f = firstSessionForeground(resp), f.first == "tee" {
+                ranWithoutShell = firstSessionNode(resp)?["foregroundShell"] == nil
+                break
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        }
+        XCTAssertTrue(ranWithoutShell, "a pane running a program must drop foregroundShell")
+    }
+
+    /// The first session's whole node from a `tree` response dict, or nil.
+    private func firstSessionNode(_ response: [String: Any]) -> [String: Any]? {
+        guard let result = response["result"] as? [String: Any],
+              let tree = result["tree"] as? [String: Any],
+              let workspaces = tree["workspaces"] as? [[String: Any]],
+              let sessions = workspaces.first?["sessions"] as? [[String: Any]] else { return nil }
+        return sessions.first
     }
 
     /// The first session's `foreground` argv from a `tree` response dict, or nil if at the prompt.
@@ -138,6 +186,125 @@ final class ControlAPIUITests: ControlAPITestCase {
             }
         }
         return nil
+    }
+
+    private func pollSessionNode(_ id: String, timeout: TimeInterval,
+                                 matching predicate: ([String: Any]) -> Bool) throws -> [String: Any]? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let response = try sendCommand(#"{"cmd":"tree"}"#)
+            if let node = sessionNode(response, id: id), predicate(node) { return node }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+        }
+        let response = try sendCommand(#"{"cmd":"tree"}"#)
+        guard let node = sessionNode(response, id: id), predicate(node) else { return nil }
+        return node
+    }
+
+    func testSessionSwapExchangesTreeState() throws {
+        let id = try activeSessionID()
+        let split = try sendCommand(#"{"cmd":"session.split","target":"\#(id)","args":{"mode":"on"}}"#)
+        XCTAssertEqual(split["ok"] as? Bool, true, "session.split should succeed: \(split)")
+        XCTAssertTrue(pollActiveSessionSplit(true, timeout: 4), "the split should be shown")
+
+        let leftDir = markerDir.appendingPathComponent("swap-left", isDirectory: true)
+        let rightDir = markerDir.appendingPathComponent("swap-right", isDirectory: true)
+        try FileManager.default.createDirectory(at: leftDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: rightDir, withIntermediateDirectories: true)
+        let leftReady = markerDir.appendingPathComponent("swap-left-ready")
+        let rightReady = markerDir.appendingPathComponent("swap-right-ready")
+        let leftForeground = markerDir.appendingPathComponent("swap-left-foreground")
+        let rightForeground = markerDir.appendingPathComponent("swap-right-foreground")
+        let leftCommand = "printf READY > '\(leftReady.path)'; cd '\(leftDir.path)'; "
+            + "printf '\\033]2;SWAP-LEFT-TITLE\\007'; exec tee '\(leftForeground.path)'\n"
+        let rightCommand = "printf READY > '\(rightReady.path)'; cd '\(rightDir.path)'; "
+            + "printf '\\033]2;SWAP-RIGHT-TITLE\\007'; exec tee '\(rightForeground.path)'\n"
+        XCTAssertEqual(try typeUntilMarker(
+            leftCommand, target: id, file: leftReady, select: false, pane: "left", attempts: 2, perAttempt: 2),
+                       "READY", "the left pane should enter its distinct cwd/title/foreground")
+        XCTAssertEqual(try typeUntilMarker(
+            rightCommand, target: id, file: rightReady, select: false, pane: "right", attempts: 2, perAttempt: 2),
+                       "READY", "the right pane should enter its distinct cwd/title/foreground")
+
+        let before = try XCTUnwrap(pollSessionNode(id, timeout: 4) { node in
+            URL(fileURLWithPath: node["cwd"] as? String ?? "").lastPathComponent == leftDir.lastPathComponent
+                && node["title"] as? String == "SWAP-LEFT-TITLE"
+                && node["foreground"] as? [String] == ["tee", leftForeground.path]
+                && node["splitForeground"] as? [String] == ["tee", rightForeground.path]
+        }, "tree should settle both panes before swap")
+        XCTAssertEqual(before["split"] as? Bool, true)
+
+        let swapped = try sendCommand(#"{"cmd":"session.swap","target":"\#(id)"}"#)
+        XCTAssertEqual(swapped["ok"] as? Bool, true, "session.swap should succeed: \(swapped)")
+
+        let after = try XCTUnwrap(pollSessionNode(id, timeout: 3) { node in
+            URL(fileURLWithPath: node["cwd"] as? String ?? "").lastPathComponent == rightDir.lastPathComponent
+                && node["title"] as? String == "SWAP-RIGHT-TITLE"
+                && node["foreground"] as? [String] == ["tee", rightForeground.path]
+                && node["splitForeground"] as? [String] == ["tee", leftForeground.path]
+        }, "tree should expose the former right pane as the session primary")
+        XCTAssertEqual(after["split"] as? Bool, true, "swap must not hide or close the split")
+    }
+
+    func testSessionSwapHiddenSplitReshowsInExchangedPositions() throws {
+        let id = try activeSessionID()
+        XCTAssertEqual(try sendCommand(
+            #"{"cmd":"session.split","target":"\#(id)","args":{"mode":"on"}}"#)["ok"] as? Bool,
+            true, "session.split on should succeed")
+        XCTAssertTrue(pollActiveSessionSplit(true, timeout: 4), "the split should be shown")
+
+        let originalLeftFile = markerDir.appendingPathComponent("swap-original-left-tty")
+        let originalRightFile = markerDir.appendingPathComponent("swap-original-right-tty")
+        let originalLeft = try XCTUnwrap(typeUntilMarker(
+            "tty > '\(originalLeftFile.path)'\n", target: id, file: originalLeftFile, select: false, pane: "left",
+            attempts: 2, perAttempt: 2),
+            "the original left pane should report its PTY")
+        let originalRight = try XCTUnwrap(typeUntilMarker(
+            "tty > '\(originalRightFile.path)'\n", target: id, file: originalRightFile, select: false, pane: "right",
+            attempts: 2, perAttempt: 2),
+            "the original right pane should report its PTY")
+        XCTAssertNotEqual(originalLeft, originalRight, "the two pane identities must be distinct")
+        XCTAssertEqual(try sendCommand(
+            #"{"cmd":"session.focus","target":"\#(id)","args":{"pane":"left"}}"#)["ok"] as? Bool,
+            true, "the original left pane should focus before hiding")
+        XCTAssertTrue(try pollSplitFocused(id, expected: false, timeout: 3),
+                      "the asynchronous left focus request should settle before hiding")
+
+        XCTAssertEqual(try sendCommand(
+            #"{"cmd":"session.split","target":"\#(id)","args":{"mode":"off"}}"#)["ok"] as? Bool,
+            true, "session.split off should hide the split")
+        XCTAssertTrue(pollActiveSessionSplit(false, timeout: 3), "the split should be hidden before swap")
+        let swapped = try sendCommand(#"{"cmd":"session.swap","target":"\#(id)"}"#)
+        XCTAssertEqual(swapped["ok"] as? Bool, true, "a hidden split should still swap: \(swapped)")
+        XCTAssertEqual(try sendCommand(
+            #"{"cmd":"session.split","target":"\#(id)","args":{"mode":"on"}}"#)["ok"] as? Bool,
+            true, "session.split on should re-show the exchanged panes")
+        XCTAssertTrue(pollActiveSessionSplit(true, timeout: 3), "the exchanged split should be shown again")
+        XCTAssertTrue(try pollSplitFocused(id, expected: true, timeout: 3),
+                      "focus should follow the original left terminal into the right slot")
+
+        app.activate()
+        XCTAssertEqual(try sendCommand(
+            #"{"cmd":"session.focus","target":"\#(id)","args":{"pane":"left"}}"#)["ok"] as? Bool,
+            true, "the re-shown left pane should focus")
+        XCTAssertTrue(try pollSplitFocused(id, expected: false, timeout: 3),
+                      "the asynchronous left focus request should settle before keyboard input")
+        let afterLeftFile = markerDir.appendingPathComponent("swap-after-left-tty")
+        let afterLeft = try XCTUnwrap(keyboardTypeUntilMarker(
+            "tty > '\(afterLeftFile.path)'", file: afterLeftFile, attempts: 2, perAttempt: 2),
+            "the re-shown left pane should accept keyboard input")
+        XCTAssertEqual(afterLeft, originalRight, "the original right terminal must now occupy the left position")
+
+        XCTAssertEqual(try sendCommand(
+            #"{"cmd":"session.focus","target":"\#(id)","args":{"pane":"right"}}"#)["ok"] as? Bool,
+            true, "the re-shown right pane should focus")
+        XCTAssertTrue(try pollSplitFocused(id, expected: true, timeout: 3),
+                      "the asynchronous right focus request should settle before keyboard input")
+        let afterRightFile = markerDir.appendingPathComponent("swap-after-right-tty")
+        let afterRight = try XCTUnwrap(keyboardTypeUntilMarker(
+            "tty > '\(afterRightFile.path)'", file: afterRightFile, attempts: 2, perAttempt: 2),
+            "the re-shown right pane should accept keyboard input")
+        XCTAssertEqual(afterRight, originalLeft, "the original left terminal must now occupy the right position")
     }
 
     // the WIPE itself is only observable across a quit, so this covers the arm, not the wipe.
@@ -215,6 +382,24 @@ final class ControlAPIUITests: ControlAPITestCase {
         XCTAssertEqual(node["restoreCommand"] as? String, "echo promoted",
                        "the promoted survivor's token must resolve to the MAIN pane")
         XCTAssertNil(node["splitRestoreCommand"], "nothing may be pinned on the vacated split slot")
+    }
+
+    // a ui-test pane runs no zmx client, so it reports no lead: the refusals are what is reachable here.
+    func testSessionLeadRefusesAPaneWithNoLead() throws {
+        let sessionID = try activeSessionID()
+        let plain = try sendCommand(#"{"cmd":"session.lead","target":"\#(sessionID)"}"#)
+        XCTAssertEqual(plain["ok"] as? Bool, false)
+        XCTAssertEqual(plain["error"] as? String, "pane has no lead to take", "\(plain)")
+
+        let noSplit = try sendCommand(#"{"cmd":"session.lead","target":"\#(sessionID)","args":{"pane":"split"}}"#)
+        XCTAssertEqual(noSplit["error"] as? String, "session has no split pane", "\(noSplit)")
+        let scratch = try sendCommand(#"{"cmd":"session.lead","target":"\#(sessionID)","args":{"pane":"scratch"}}"#)
+        XCTAssertEqual(scratch["error"] as? String, "the scratch terminal has no lead", "\(scratch)")
+        let invalid = try sendCommand(#"{"cmd":"session.lead","target":"\#(sessionID)","args":{"pane":"middle"}}"#)
+        XCTAssertEqual(invalid["error"] as? String, "invalid pane: middle", "\(invalid)")
+
+        let surfaces = try XCTUnwrap(try restoreNode(sessionID)["surfaces"] as? [[String: Any]])
+        XCTAssertTrue(surfaces.allSatisfy { $0["lead"] == nil }, "omitted, not null, for a pane with no role")
     }
 
     // the last case is where session.restore diverges from session.status, which falls back to left.
@@ -339,6 +524,22 @@ final class ControlAPIUITests: ControlAPITestCase {
         let longText = String(repeating: "A", count: 5000)
         let tooLong = try sendCommand(#"{"cmd":"session.background","target":"\#(sid)","args":{"mode":"text","text":"\#(longText)"}}"#)
         XCTAssertEqual(tooLong["ok"] as? Bool, false, "an over-long watermark text should be rejected")
+
+        let background = { (args: String) in #"{"cmd":"session.background","target":"\#(sid)","args":{\#(args)}}"# }
+        let paneText = { (node: [String: Any], pane: String) in ((node["paneBackgrounds"] as? [String: Any])?[pane] as? [String: Any])?["text"] as? String }
+        XCTAssertEqual(try sendCommand(background(#""mode":"text","text":"PEER","pane":"right""#))["error"] as? String, "session has no split pane")
+        XCTAssertEqual(try sendCommand(#"{"cmd":"session.split","target":"\#(sid)","args":{"mode":"on"}}"#)["ok"] as? Bool, true)
+        XCTAssertEqual(try sendCommand(background(#""mode":"text","text":"PEER","pane":"right""#))["ok"] as? Bool, true)
+        let labelled = try XCTUnwrap(pollSessionNode(sid, timeout: 3) { paneText($0, "right") == "PEER" && paneText($0, "left") == nil })
+        XCTAssertEqual((labelled["background"] as? [String: Any])?["colorHex"] as? String, "#ff0000", "the default reads back beside the override")
+        var swapped: [String: Any] = [:]
+        for _ in 0..<20 where swapped["ok"] as? Bool != true {
+            swapped = try sendCommand(#"{"cmd":"session.swap","target":"\#(sid)"}"#)
+            if swapped["ok"] as? Bool != true { Thread.sleep(forTimeInterval: 0.2) }
+        }
+        XCTAssertNotNil(try pollSessionNode(sid, timeout: 3) { paneText($0, "left") == "PEER" && paneText($0, "right") == nil }, "the label follows the swap: \(swapped)")
+        XCTAssertEqual(try sendCommand(background(#""mode":"clear","pane":"left""#))["ok"] as? Bool, true)
+        XCTAssertNotNil(try pollSessionNode(sid, timeout: 3) { $0["paneBackgrounds"] == nil && $0["background"] != nil }, "a pane clear returns it to the default")
 
         let cleared = try sendCommand(#"{"cmd":"session.background","target":"\#(sid)","args":{"mode":"clear"}}"#)
         XCTAssertEqual(cleared["ok"] as? Bool, true, "session.background clear should succeed: \(cleared)")
@@ -549,7 +750,8 @@ final class ControlAPIUITests: ControlAPITestCase {
     }
 
     // the promoted survivor is the MAIN pane now, so its keystrokes must not clear the fresh split's
-    // `.right` block. Real keystrokes are load-bearing: a session.type inject skips onUserInputClearsStatus.
+    // `.right` block. Real keystrokes pin the keyDown path itself, which resolves the pane from the LIVE
+    // `isSplitPane` at press time; `session.type` reaches the same clear through `injectAsUserInput`.
     func testPromotedMainPaneDoesNotClearSplitRightStatus() throws {
         let sid = try activeSessionID()
 
@@ -1562,6 +1764,98 @@ final class ControlAPIUITests: ControlAPITestCase {
         XCTAssertEqual(response["ok"] as? Bool, true, "version should ignore addressing: \(response)")
         let result = try XCTUnwrap(response["result"] as? [String: Any], "version should carry a result")
         XCTAssertNotNil(result["app"], "the identity should come back regardless of addressing: \(response)")
+    }
+
+    // MARK: - Hooks
+
+    // hooks.reload re-reads hooks.conf and returns the parse-diagnostic count; the auto-created starter is
+    // all comments, so a fresh launch reports zero.
+    func testHooksReloadReportsZeroDiagnostics() throws {
+        let response = try sendCommand(#"{"cmd":"hooks.reload"}"#)
+        XCTAssertEqual(response["ok"] as? Bool, true, "hooks.reload should succeed: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "hooks.reload should carry a result")
+        XCTAssertEqual(result["count"] as? Int, 0, "the all-comment starter hooks file should have no diagnostics: \(response)")
+    }
+
+    func testHooksReloadReportsDiagnosticsForBrokenFile() throws {
+        try relaunch(withHooks: "bogus verb here\n")
+        let response = try sendCommand(#"{"cmd":"hooks.reload"}"#)
+        XCTAssertEqual(response["ok"] as? Bool, true, "hooks.reload should succeed even with a broken file: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "hooks.reload should carry a result")
+        XCTAssertEqual(result["count"] as? Int, 1, "one broken line should yield one diagnostic: \(response)")
+    }
+
+    func testHooksListReportsPathDiagnosticsAndEntries() throws {
+        try relaunch(withHooks: "on status true\nbad line\non notify echo hi | cat\n")
+        let response = try sendCommand(#"{"cmd":"hooks.list"}"#)
+        XCTAssertEqual(response["ok"] as? Bool, true, "hooks.list should succeed: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "hooks.list should carry a result")
+        let hooks = try XCTUnwrap(result["hooks"] as? [String: Any], "hooks.list should carry a hooks payload")
+        XCTAssertTrue((hooks["path"] as? String ?? "").hasSuffix("/config/hooks.conf"), "path should be the isolated file: \(hooks)")
+        let diagnostics = try XCTUnwrap(hooks["diagnostics"] as? [[String: Any]])
+        XCTAssertEqual(diagnostics.map { $0["line"] as? Int }, [2])
+        let rows = try XCTUnwrap(hooks["hooks"] as? [[String: Any]])
+        XCTAssertEqual(rows.map { $0["kind"] as? String }, ["status", "notify"])
+        XCTAssertEqual(rows.map { $0["command"] as? String }, ["true", "echo hi | cat"])
+        XCTAssertEqual(rows.map { $0["line"] as? Int }, [1, 3])
+        XCTAssertEqual(rows.map { $0["pending"] as? Int }, [0, 0])
+        XCTAssertNil(rows[0]["runningPid"], "an idle hook carries no pid: \(rows[0])")
+    }
+
+    // the hook's agtermctl call queues behind the request that fired it; both must complete
+    func testHookCallingTheSameSocketCompletesWithTheOriginalRequest() throws {
+        try relaunch(withHooks: #"on status [ "$AGT_EVENT_STATUS" = blocked ] || exit 0; agtermctl notify "hook ran" --target "$AGT_SESSION_ID" --socket "$AGT_SOCKET""# + "\n")
+        let seeded = try activeSessionID()
+        let anchor = try sendCommand(#"{"cmd":"events.read"}"#)
+        let anchorResult = try XCTUnwrap(anchor["result"] as? [String: Any])
+        let events = try XCTUnwrap(anchorResult["events"] as? [String: Any])
+        let run = try XCTUnwrap(events["run"] as? String)
+        let after = try XCTUnwrap(events["next"] as? Int)
+
+        let status = try sendCommand(#"{"cmd":"session.status","target":"\#(seeded)","args":{"status":"blocked"}}"#)
+        XCTAssertEqual(status["ok"] as? Bool, true, "the originating request must return on its own: \(status)")
+
+        let deadline = Date().addingTimeInterval(15)
+        var sawNotify = false
+        var quiescent = false
+        while Date() < deadline, !(sawNotify && quiescent) {
+            let page = try sendCommand(#"{"cmd":"events.read","args":{"run":"\#(run)","after":"\#(after)","kinds":["notify"]}}"#)
+            let items = ((page["result"] as? [String: Any])?["events"] as? [String: Any])?["items"] as? [[String: Any]] ?? []
+            sawNotify = items.contains { (($0["payload"] as? [String: Any])?["body"] as? String) == "hook ran" }
+            let list = try sendCommand(#"{"cmd":"hooks.list"}"#)
+            let rows = ((list["result"] as? [String: Any])?["hooks"] as? [String: Any])?["hooks"] as? [[String: Any]] ?? []
+            quiescent = rows.count == 1 && rows[0]["runningPid"] == nil && rows[0]["pending"] as? Int == 0
+                && rows[0]["lastFailure"] == nil
+            if !(sawNotify && quiescent) { Thread.sleep(forTimeInterval: 0.25) }
+        }
+        XCTAssertTrue(sawNotify, "the hook's notify should reach the ring through the same socket")
+        XCTAssertTrue(quiescent, "the hook should finish with no running child, no pending work and no failure")
+    }
+
+    func testEditHooksOverlayCloseReloadsTheFile() throws {
+        let seeded = try activeSessionID()
+        app.menuBars.menuBarItems["File"].click()
+        let item = app.menuItems["Edit Hooks…"]
+        XCTAssertTrue(item.waitForExistence(timeout: 5), "File menu should list Edit Hooks")
+        item.click()
+        XCTAssertTrue(poll(until: (try? sessionNodeIfPresent(id: seeded))??["overlay"] as? Bool == true, timeout: 10),
+                      "Edit Hooks should open an overlay on the active session")
+
+        let file = stateDir.appendingPathComponent("config", isDirectory: true).appendingPathComponent("hooks.conf")
+        let handle = try FileHandle(forWritingTo: file)
+        handle.seekToEndOfFile()
+        handle.write(Data("on notify true\n".utf8))
+        try handle.close()
+        let close = try sendCommand(#"{"cmd":"session.overlay.close","target":"\#(seeded)"}"#)
+        XCTAssertEqual(close["ok"] as? Bool, true, "closing the editor overlay should succeed: \(close)")
+
+        var rows: [[String: Any]] = []
+        let reloaded = poll(until: {
+            let list = (try? sendCommand(#"{"cmd":"hooks.list"}"#)) ?? [:]
+            rows = ((list["result"] as? [String: Any])?["hooks"] as? [String: Any])?["hooks"] as? [[String: Any]] ?? []
+            return rows.contains { $0["kind"] as? String == "notify" && $0["command"] as? String == "true" }
+        }(), timeout: 10)
+        XCTAssertTrue(reloaded, "closing the editor overlay should reload hooks.conf: \(rows)")
     }
 
     // MARK: - Keymap

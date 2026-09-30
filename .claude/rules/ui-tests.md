@@ -36,6 +36,9 @@ These run inside the app, so a mistake can kill the host instead of failing an a
 
 - `agtermUITests/` launches the real app and drives UI behavior unavailable to host-free tests.
   Run with `xcodebuild test -project agterm.xcodeproj -scheme agterm -destination 'platform=macOS'`.
+- Default UI-test launches bypass live-session wrapping through the existing UI-test sentinel. Only the
+  focused zmx persistence test sets `AGTERM_UITEST_ENABLE_ZMX=1`; it must kill its exact test daemons in
+  teardown so they cannot leak into later tests.
 - Pass a temporary `AGTERM_STATE_DIR` in the launch environment; `agtermApp.restoredStore()` honors it.
   Verify the native `Open Directory...` panel manually.
 - **Use `app.launchForUITest()`, never `app.launch()`.** FB11763863 on macOS 15+/Xcode 16+, including
@@ -121,3 +124,7 @@ These run inside the app, so a mistake can kill the host instead of failing an a
   `RestoreCommandUITests.testRestoreReRunsShellScriptWrapper` uses `sh -c 'tee ...; true'` so `sh` remains
   foreground. Do not execute a script from the runner's sandboxed temp dir; the app can write there but
   cannot exec it.
+- The runner's sandbox grants `network.client` only, so an `NWListener` in the test fails `bind` with
+  EPERM. A test needing an HTTP server has the app run it in a background session
+  (`session.new` with `/usr/bin/python3 -m http.server PORT --bind 127.0.0.1 --directory DIR`) and polls
+  it from the runner as a client; see `ControlHtmlOverlayUITests`.

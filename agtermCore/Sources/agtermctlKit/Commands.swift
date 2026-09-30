@@ -83,14 +83,15 @@ struct SurfaceTargetOptions: ParsableArguments {
     var target: String = "active"
 }
 
-/// The root `agtermctl` command. Subcommands mirror the control catalog 1:1.
+/// The root `agtermctl` command. Subcommands mirror the control catalog 1:1, except `terminfo`, which runs
+/// locally and never opens the socket.
 public struct Agtermctl: ParsableCommand {
     public static let configuration = CommandConfiguration(
         commandName: "agtermctl",
-        abstract: "Drive agterm over its control socket.",
+        abstract: "Drive agterm over its control socket, and install its terminfo entry on other hosts.",
         subcommands: [Tree.self, Events.self, Workspace.self, Session.self, Surface.self, Dashboard.self, Window.self, Quick.self,
-                      Sidebar.self, Notify.self, Font.self, Keymap.self, Config.self, Theme.self, Pick.self, Restore.self,
-                      Version.self]
+                      Sidebar.self, Notify.self, Font.self, Keymap.self, Hooks.self, Config.self, Theme.self, Pick.self, Ask.self, Restore.self,
+                      Zmx.self, Terminfo.self, Version.self]
     )
 
     public init() {}
@@ -118,10 +119,18 @@ extension RequestCommand {
     func defaultRun() throws {
         let request = try makeRequest()
         let client = SocketClient(path: options.socketPath())
-        let response = try client.send(request)
-        SocketClient.printResponse(response, json: options.json, echoID: echoesResultID)
-        if !response.ok { throw ExitCode.failure }
+        let reply = try client.send(request)
+        SocketClient.printResponse(reply, json: options.json, echoID: echoesResultID)
+        if !reply.response.ok { throw ExitCode.failure }
     }
+}
+
+/// Decodes a `type` command's stdin payload, whose contract is text; an invalid byte empties it entirely.
+func decodeTypedStdin(_ input: Data) throws -> String {
+    guard let text = String(data: input, encoding: .utf8) else {
+        throw ValidationError("stdin must be valid UTF-8")
+    }
+    return text
 }
 
 // MARK: - tree

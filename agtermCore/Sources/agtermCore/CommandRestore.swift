@@ -5,7 +5,7 @@ import Foundation
 /// back into a shell command line. The app target owns only the `sysctl`/libghostty calls; every
 /// judgement defers here so it stays unit-tested and off the C boundary.
 public enum CommandRestore {
-    /// The login shells treated as "no program to restore" (the pane was at its prompt).
+    /// The login shells treated as "no program to restore" (a shell held the pane, nothing to re-run).
     private static let knownShells: Set<String> = ["zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh"]
 
     /// Sanity cap on argc: a corrupt header must not drive `reserveCapacity` into a huge allocation.
@@ -27,14 +27,53 @@ public enum CommandRestore {
         return false
     }
 
-    /// Whether `argv` is an interactive shell at its prompt — the "idle pane, nothing to restore" case:
-    /// `argv[0]` is a known shell (or `$SHELL`, passed as `extra`) AND only option flags follow it. A
+    /// Whether `argv` is shell-shaped with nothing to restore: `argv[0]` is a known shell (or `$SHELL`,
+    /// passed as `extra`) AND only option flags follow it. NOT proof of an interactive prompt, since a
+    /// builtin or a shell loop runs in the shell process and leaves argv untouched. A
     /// shell RUNNING something is NOT idle and IS captured — a script path (`/bin/sh /usr/local/bin/cld`,
     /// the foreground of any `#!/bin/sh` wrapper) or a `-c` command leaves a non-flag argument after
     /// `argv[0]`.
     public static func isIdleShell(argv: [String], extra: String? = nil) -> Bool {
         guard let first = argv.first, isKnownShell(basename(first), extra: extra) else { return false }
         return !argv.dropFirst().contains { !$0.hasPrefix("-") }
+    }
+
+    /// What a pane's foreground argv means to the `tree` read: a program to report, or a recognized shell in
+    /// the foreground. The restore capture collapses `foregroundShell` to nil: otherwise `hadForeground`
+    /// would suppress `initialCommand` in `restorePlan`.
+    public enum PaneForeground: Sendable, Equatable {
+        /// A real foreground program, argv dash-stripped and ready to render.
+        case program([String])
+        /// A RECOGNIZED shell IN THE FOREGROUND, as its basename (`zsh`, `fish`) — not a claim that it sits at
+        /// a prompt, since a builtin runs in the shell process and leaves argv unchanged. A shell matching
+        /// neither the known set nor `$SHELL` is not recognized and reports as `program` instead.
+        case foregroundShell(String)
+
+        /// The argv the tree reports as `foreground`; nil when a shell holds the foreground.
+        public var command: [String]? {
+            if case .program(let argv) = self { return argv }
+            return nil
+        }
+
+        /// The basename the tree reports as `foregroundShell`; nil while a program runs.
+        public var shellName: String? {
+            if case .foregroundShell(let name) = self { return name }
+            return nil
+        }
+    }
+
+    /// Classify a pane's raw foreground argv for the `tree` read. Nil for an empty argv only; the two live
+    /// answers are the cases of `PaneForeground`. `extra` is the user's `$SHELL` basename, widening
+    /// recognition to a non-standard login shell exactly as `isIdleShell` does.
+    ///
+    /// The shell basename is taken AFTER `stripLoginDash`, never before: `basename` splits on `/`, so it
+    /// drops the login mark from a path form (`-/bin/zsh`) but keeps it on the bare form (`-zsh`), which is
+    /// the common case and would otherwise reach callers as `-zsh`.
+    public static func paneForeground(argv: [String], extra: String? = nil) -> PaneForeground? {
+        guard !argv.isEmpty else { return nil }
+        let stripped = stripLoginDash(argv)
+        if isIdleShell(argv: argv, extra: extra) { return .foregroundShell(basename(stripped[0])) }
+        return .program(stripped)
     }
 
     /// Drop the leading `-` macOS dash-marks a login process's argv[0] with, so the argv names a program
@@ -102,20 +141,22 @@ public enum CommandRestore {
 
     /// The mutually-exclusive surface seed a pane restores/creates with. `command` != nil → the exec path
     /// (replaces the shell, closes on exit); else `initialInput` is typed into a login shell, or both nil =
-    /// a plain shell.
+    /// a plain shell. `waitAfterCommand` is effective only on the exec path.
     public struct RestorePlan: Equatable, Sendable {
         public let command: String?
         public let initialInput: String?
-        public init(command: String?, initialInput: String?) {
+        public let waitAfterCommand: Bool
+        public init(command: String?, initialInput: String?, waitAfterCommand: Bool = false) {
             self.command = command
             self.initialInput = initialInput
+            self.waitAfterCommand = waitAfterCommand
         }
     }
 
     /// The inputs `restorePlan` decides from.
     /// - `wasRestored`: the session came from a restore (a FRESH command session always runs its command, a
-    ///   RESTORED one only when the opt-in is on).
-    /// - `restoreEnabled`: the `restoreRunningCommand` opt-in.
+    ///   RESTORED one only in rerun mode).
+    /// - `restoreEnabled`: whether the immutable launch mode is `rerun`.
     /// - `hadForeground`: a foreground command was CAPTURED, at the last quit or by `restore.capture`. It
     ///   PREEMPTS `initialCommand` even when suppressed (denylisted/off → `foregroundInput` nil), yielding a
     ///   plain shell rather than the stale creation command — so gate on capture, not on the input surviving.
@@ -123,6 +164,7 @@ public enum CommandRestore {
     /// - `initialCommand`: the session's persisted `--command`.
     /// - `restoreOverride`: the pane's pinned restore command (`session.restore`), tri-state — nil = no
     ///   override, `""` = pinned to nothing, `"cmd"` = run this shell line.
+    /// - `requestedWait`: whether a creation command should hold after exit; ignored without an effective command.
     public struct RestoreInputs: Equatable, Sendable {
         public let wasRestored: Bool
         public let restoreEnabled: Bool
@@ -130,20 +172,23 @@ public enum CommandRestore {
         public let foregroundInput: String?
         public let initialCommand: String?
         public let restoreOverride: String?
+        public let requestedWait: Bool
         public init(wasRestored: Bool, restoreEnabled: Bool, hadForeground: Bool,
-                    foregroundInput: String?, initialCommand: String?, restoreOverride: String?) {
+                    foregroundInput: String?, initialCommand: String?, restoreOverride: String?,
+                    requestedWait: Bool = false) {
             self.wasRestored = wasRestored
             self.restoreEnabled = restoreEnabled
             self.hadForeground = hadForeground
             self.foregroundInput = foregroundInput
             self.initialCommand = initialCommand
             self.restoreOverride = restoreOverride
+            self.requestedWait = requestedWait
         }
     }
 
     /// The `initial_input` for a pane: a pinned override (empty → nil, a plain shell) when one exists, else
-    /// the captured foreground input. The override is gated on `restoreEnabled`, keeping the toggle the
-    /// single master switch (like `initialCommand`, the other explicit user-set seed), and is typed
+    /// the captured foreground input. The override is gated on `restoreEnabled`, keeping rerun mode the
+    /// single switch (like `initialCommand`, the other explicit user-set seed), and is typed
     /// VERBATIM — never through `shellQuotedLine` — so `cd x && claude --resume y` works as written; the
     /// captured input arrives already gated + denylist-filtered from the app side.
     public static func restoreInput(restoreEnabled: Bool, restoreOverride: String?,
@@ -164,7 +209,7 @@ public enum CommandRestore {
     /// boundary; the app target owns only the libghostty seeding. A present `restoreOverride`
     /// short-circuits everything: it wins over the captured foreground and `initialCommand`, `command` is
     /// always nil (an override never takes the exec path), and the input comes from `restoreInput` — so it
-    /// obeys the `restoreEnabled` toggle while bypassing the denylist, which guards BLIND capture, not a
+    /// obeys the `restoreEnabled` launch mode while bypassing the denylist, which guards BLIND capture, not a
     /// deliberately named command. With no override the capture/`initialCommand` precedence applies.
     public static func restorePlan(_ inputs: RestoreInputs) -> RestorePlan {
         if inputs.restoreOverride != nil {
@@ -174,7 +219,8 @@ public enum CommandRestore {
         }
         let mayRunInitial = !inputs.wasRestored || inputs.restoreEnabled
         let command = (!inputs.hadForeground && mayRunInitial) ? inputs.initialCommand : nil
-        return RestorePlan(command: command, initialInput: command == nil ? inputs.foregroundInput : nil)
+        return RestorePlan(command: command, initialInput: command == nil ? inputs.foregroundInput : nil,
+                           waitAfterCommand: command != nil && inputs.requestedWait)
     }
 
     /// Parse `restore-denylist.conf` into a set of program basenames NOT to re-run on restore: one entry
